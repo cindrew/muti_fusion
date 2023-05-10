@@ -57,9 +57,10 @@ struct IMUState
     // and acceleration.
     Eigen::Vector3d gyro_bias;
     Eigen::Vector3d acc_bias;
-    // 2023-05-01 新增符合松组合的零偏项（3项）
+    // 2023-05-01 新增符合松组合的零偏项（3项）  // 增加gyrosOffset：载体在静止情况下的角速度误差估计
     Eigen::Vector3d gyros_bias;
     Eigen::Vector3d gyros_markov_bias;
+    Eigen::Vector3d gyrosOffset;
     Eigen::Vector3d acc_markov_bias;
 
     // Transformation between the IMU and the
