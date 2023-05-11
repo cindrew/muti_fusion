@@ -359,17 +359,45 @@ private:
     void ForsenseMsgGyroToEigen(const forsense_msg::Forsense &m, Eigen::Vector3d &e)
     {
         // 这里主要是将自定义的数据转为Eigen中的向量形式（IMU角速度值信息）
-        e(0) = m.gyro[0];
-        e(1) = m.gyro[1];
+        // e(0) = m.gyro[0];
+        // e(1) = m.gyro[1];
+        // e(2) = m.gyro[2];
+        e(0) = -m.gyro[1] * rad2deg;
+        e(1) = m.gyro[0] * rad2deg;
+        e(2) = m.gyro[2] * rad2deg;
+
+        // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];
+        // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
+    }
+
+    void ForsenseMsgGyroRadToEigen(const forsense_msg::Forsense &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式（IMU角速度值信息）
+        // e(0) = m.gyro[0];
+        // e(1) = m.gyro[1];
+        // e(2) = m.gyro[2];
+        e(0) = -m.gyro[1];
+        e(1) = m.gyro[0];
         e(2) = m.gyro[2];
+
+        // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];
+        // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
     }
 
     void ForsenseMsgAccToEigen(const forsense_msg::Forsense &m, Eigen::Vector3d &e)
     {
+        double g=9.7803698;         // 重力加速度
         // 这里主要是将自定义的数据转为Eigen中的向量形式（IMU加速度值信息）
-        e(0) = m.accel[0];
-        e(1) = m.accel[1];
-        e(2) = m.accel[2];
+        // e(0) = m.accel[0];
+        // e(1) = m.accel[1];
+        // e(2) = m.accel[2];
+        e(0) = -m.accel[1] * g;
+        e(1) = m.accel[0] * g;
+        e(2) = m.accel[2] * g;
+
+
+        // m_acc_618Dpro_RFU << -m_acc_618Dpro[1], m_acc_618Dpro[0], m_acc_618Dpro[2];
+        // m_acc_618Dpro_RFU_mss = m_acc_618Dpro_RFU * g;  // （m/s/s）
     }
 
     void ForsenseMsgTimeToDouble(const forsense_msg::Forsense &m, double &e)

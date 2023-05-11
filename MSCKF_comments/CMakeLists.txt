@@ -4,6 +4,7 @@ project(msckf_vio CXX)
 if(NOT CMAKE_BUILD_TYPE)
   # set(CMAKE_BUILD_TYPE Release)
   set(CMAKE_BUILD_TYPE "Debug")
+  add_definitions("-Wall -g")
 endif()
 
 add_compile_options(-std=c++14)
