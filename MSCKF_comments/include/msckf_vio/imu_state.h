@@ -114,6 +114,9 @@ struct IMUState
     // Normally, this transform should be identity.
     static Eigen::Isometry3d T_imu_body;
 
+    // 记录零偏修正后的角速度
+    Eigen::Vector3d angular_velocity;
+
     IMUState() 
         : id(0), time(0),
         orientation(Eigen::Vector4d(0, 0, 0, 1)),

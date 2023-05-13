@@ -65,6 +65,8 @@ map<int, double> MsckfVio::chi_squared_test_table;
 MsckfVio::MsckfVio(ros::NodeHandle& pnh):
     is_gravity_set(false),
     is_first_img(true),
+    is_gyrobias_set(false),
+    is_first_GPS(true),
     // is_aligned(false),
     // last_check_GPS_time(0),
     // 2023-04-30 新增判断是否初始化完成（也就是参考值是否赋值作为初值）
@@ -303,21 +305,24 @@ bool MsckfVio::createRosIO()
     mocap_odom_sub = nh.subscribe("mocap_odom", 10, &MsckfVio::mocapOdomCallback, this);
     mocap_odom_pub = nh.advertise<nav_msgs::Odometry>("gt_odom", 1);
 
-    // 2023-04-26 接受GPS的真值数据
+    // 2023-04-26 接受GPS的位置数据
     gps_sub=nh.subscribe("gps_position", 10, & MsckfVio::GPSCallback, this);
     // gps_vel_sub=nh.subscribe("gps_velocity", 10, & MsckfVio::GPSVelCallback, this);
 
-        // 2023-04-27 定义好pub，用于数据的输出
-    // gps_pub=nh.advertise<sensor_msgs::NavSatFix>("gps_pos", 10);
-    // gps_vel_pub=nh.advertise<forsense_msg::RtkVelocity>("gps_vel", 10);
+    // 2023-05-12 加入参考值的读取
+    Tru_sub=nh.subscribe("Reference_states", 10, & MsckfVio::ReferenceCallback, this);
 
-    // 2023-04-29 基于旧的消息重新定义好数据的发布
-    gps_pub=nh.advertise<forsense_msg::Forsense>("gps_pos", 10000);
-    gps_vel_pub=nh.advertise<forsense_msg::Forsense>("gps_vel", 10000);
+    // // 2023-04-27 定义好pub，用于数据的输出
+    // // gps_pub=nh.advertise<sensor_msgs::NavSatFix>("gps_pos", 10);
+    // // gps_vel_pub=nh.advertise<forsense_msg::RtkVelocity>("gps_vel", 10);
 
-    // 2023-04-29 基于旧的消息加入新的参考值的数据发布
-    // Tru_pub = nh.advertise<forsense_msg::Forsense>("Tru_pso",10000);
-    Tru_vel_pub = nh.advertise<forsense_msg::Forsense>("Tru_vel",10000);
+    // // 2023-04-29 基于旧的消息重新定义好数据的发布
+    // gps_pub=nh.advertise<forsense_msg::Forsense>("gps_pos", 10000);
+    // gps_vel_pub=nh.advertise<forsense_msg::Forsense>("gps_vel", 10000);
+
+    // // 2023-04-29 基于旧的消息加入新的参考值的数据发布
+    // // Tru_pub = nh.advertise<forsense_msg::Forsense>("Tru_pso",10000);
+    // Tru_vel_pub = nh.advertise<forsense_msg::Forsense>("Tru_vel",10000);
 
     // 2023-05-02 将松组合解算的轨迹进行输出
     path_pub = nh.advertise<nav_msgs::Path>("path", 1000);
@@ -415,438 +420,623 @@ bool MsckfVio::initialize()
 //     gps_vel_pub.publish(GNSSvelo);
 //     ROS_INFO("SUCCESS GPS OUTPUT...");
 
-// }
+// }    
 
 
-// 2023-04-29 基于旧的消息类型定义下的GPS数据提取代码
-// GPS fusion part
-void MsckfVio::GPSCallback(const forsense_msg::Forsense::Ptr & gps_msg)
+
+/**
+ * @brief 重写这里的IMU数据采集，并且将采集的IMU数据用于初始化处理，并生成imu_msg_buffer用于GPScallback中的使用
+ */
+void MsckfVio::imuCallback(const sensor_msgs::ImuConstPtr &imu_msg)
 {
-    // ROS_INFO("START GPS DATA...");
-    // double time = gps_msg->header.stamp.toSec();
-    // 2023-04-29 注意由于原有的消息类型中没有加入ROS时间戳的记录，所以只能用自带的UTC/GPS时间进行处理
-    unsigned int time = gps_msg->time_gps_ms;
-    double time_trans = static_cast<double>(time)/1000.0;
+    // ROS_INFO("START IMU DATA...");
 
-    // cout<<"====================Time run here==========="<<__LINE__<<endl;
-    // ROS_INFO("===================size Zero_Second========================");
-    // ROS_INFO("my_time show 1: %f ", time_trans);
-    // ROS_INFO("==========================over================================");
-
-    // ---------------------------------------------------------------------------
-    // 2023-04-30 继续进行初始化处理，状态传递，状态观测，修正处理，状态输出等部分内容的处理
-
-    // 1、进行状态初始化处理(参考值传输过来实现)
-    forsense_msg::Forsense msg_copy;
-    msg_copy=(*gps_msg);
-    // 实现对IMU参数的记录
-    msg_copy.accel = gps_msg->accel;
-    msg_copy.gyro = gps_msg->gyro;
-
-    IMU_couter_buffer.push_back(msg_copy);
-
-    forsense_msg::Forsense msg_copy2;
-    msg_copy2.time_gps_ms = gps_msg->time_gps_ms;
-    msg_copy2.pos = gps_msg->pos;
-    msg_copy2.vel = gps_msg->vel;
-    msg_copy2.att = gps_msg->att;
-    // 这里将角速度和加速度也一并给过来，这样用来进行初始的姿态固定偏差静止估计
-    msg_copy2.accel = gps_msg->accel;
-    msg_copy2.gyro = gps_msg->gyro;
-
-    // 2023-05--07 新增对618Dpro拟合状态量的输出
-    ofstream outfile1;
-    outfile1.open("/home/wang/local/MATLAB2023/work/618Dpro_data_process/RTK_result_MSCKF1.txt",ios::app);
-    outfile1<<setprecision(20)<<msg_copy2.att[0]<<','<<msg_copy2.att[1]<<','<<msg_copy2.att[2]<<','<<msg_copy2.vel[0]<<','<<msg_copy2.vel[1]<<','<<msg_copy2.vel[2]<<','<<msg_copy2.pos[0]<<','<<msg_copy2.pos[1]<<','<<msg_copy2.pos[2]<<endl;
-    outfile1.close();
-
-    // cout<<"====================Time run here==========="<<__LINE__<<endl;
-    // ROS_INFO("===================size Zero_Second========================");
-    // ROS_INFO("my_time show 1.1: %d ", msg_copy2.time_gps_ms);
-    // ROS_INFO("==========================over================================");
-
-    Tru_couter_buffer.push_back(msg_copy2);
+    // IMU msgs are pushed backed into a buffer instead of
+    // being processed immediately. The IMU msgs are processed
+    // when the next image is available, in which way, we can
+    // easily handle the transfer delay.
+    // 1. 存放imu数据
     
-    static int dataCount = 0;                                           // 计数，用于观测修正
+    // 加入对角速度零偏的估计，用于状态修正
+    sensor_msgs::Imu msg_copy;
+    msg_copy=(*imu_msg);
 
-    if (!is_state_initial) {
+    // state_server.imu_state.angular_velocity=Vector3d(imu_msg->angular_velocity.x,
+    //                                                 imu_msg->angular_velocity.y,
+    //                                                 imu_msg->angular_velocity.z)-state_server.imu_state.gyro_bias;
 
-        static int dataCount = 0; 
-        dataCount++;
+    imu_msg_buffer.push_back(*imu_msg);
 
-        if (IMU_couter_buffer.size() < 50) return;
-        // INS_Inialization();
-        // 这里是直接将姿态、速度、位置直接拿出来进行处理
-        Vector3d atti_conference = Vector3d::Zero();
-        Vector3d vel_conference = Vector3d::Zero();
-        Vector3d posi_conference = Vector3d::Zero();
+    ROS_INFO("=============== 0 IMU Message Get========================");
+    // 打印IMU的消息
+    for (size_t i = 0; i < imu_msg_buffer.size(); i++) {
+        sensor_msgs::Imu msg = imu_msg_buffer[i];
+        // 打印消息的内容
+        std::cout << "IMU Message " << i << ":" << std::endl;
+        // 根据 sensor_msgs::Imu 消息的具体字段，打印相应内容
+        std::cout << "Field 1:time " << msg.header.stamp << std::endl;
+        std::cout << "Field 2:gyro_x " << msg.angular_velocity.x <<",Field 2:gyro_y "<< msg.angular_velocity.y <<",Field 2:gyro_z "<< msg.angular_velocity.z << std::endl;
+        std::cout << "Field 2:acc_x " << msg.linear_acceleration.x << "Field 2:acc_y " << msg.linear_acceleration.y << "Field 2:acc_z " << msg.linear_acceleration.z << std::endl;
+        // ...
+    }
 
-        Vector3d init_att = Vector3d::Zero();
-        Vector3d init_vel = Vector3d::Zero();
-        Vector3d init_pos = Vector3d::Zero();
 
-        double m_time_618Dpro, m_time_618Dpro_s;                            // 原始的618Dpro记载的缺少了ROS时间戳，所以这里是拿GPS时间来处理
+    // 2. 用50个imu数据做静止初始化，不够则不做
+    if (!is_gyrobias_set)
+    {
 
-        // 所以这里不应该拿IMU的速度，而应该拿参考值部分的消息内容
-        for (const auto &gps_msg : Tru_couter_buffer)
-        {
+        if (imu_msg_buffer.size() < 50) return;
+        // if (imu_msg_buffer.size() < 10) return;
+        // imu初始化，200个数据必须都是静止时采集的
+        // 这里面没有判断是否成功，也就是一开始如果运动会导致轨迹飘
+        initializeGyroBias();
+        is_gyrobias_set = true;
+        // ROS_INFO("START IMU OUTPUT...");
+        ROS_INFO("=============== 1 IMU INIT OK ,Get gyro bias========================");
+    }
 
-            // 使用自定义的消息类型转换（针对618Dpro旧的数据定义）
-            MsckfVio::ForsenseMsgAttiToEigen(gps_msg, init_att);
-            MsckfVio::ForsenseMsgVeloToEigen(gps_msg, init_vel);
-            MsckfVio::ForsenseMsgPosiToEigen(gps_msg, init_pos);
 
-            MsckfVio::ForsenseMsgTimeToDouble(gps_msg, m_time_618Dpro);
+    return;
+}
 
-            // // 对初始静止情况下IMU数据进行累积，用于后续估计
-            // MsckfVio::ForsenseMsgGyroToEigen(gps_msg, m_gyro_618Dpro);
-            // 对初始静止情况下IMU数据进行累积，用于后续估计(这里用rad，便于对比初始gyro，分析是第多少的数据)
-            MsckfVio::ForsenseMsgGyroRadToEigen(gps_msg, m_gyro_618Dpro);
-            state_server.imu_state.gyrosOffset += m_gyro_618Dpro * rad2deg;           // 将各个静止下的角速度进行累积，从而求得静止下的角速度零偏
-        }
+/**
+ * @brief 通过静止IMU数据，对IMU的陀螺固定零偏进行剔除
+ */
+void MsckfVio::initializeGyroBias()
+{
+    
+    for (const auto &imu_msg : imu_msg_buffer)
+    {
 
-        // 基于给入消息的数量，最终求得平均
-        state_server.imu_state.gyrosOffset /= double(dataCount);
+        // 对初始静止情况下IMU数据进行累积，用于后续估计(这里用rad，便于对比初始gyro，分析是第多少的数据)
+        MsckfVio::ForsenseMsgGyroRadNewToEigen(imu_msg, m_gyro_618Dpro);
+        state_server.imu_state.gyrosOffset += m_gyro_618Dpro * rad2deg;           // 将各个静止下的角速度进行累积，从而求得静止下的角速度零偏
+    }
+
+    // 基于给入消息的数量，最终求得平均
+    state_server.imu_state.gyrosOffset /= imu_msg_buffer.size();
+
+}
+
+/**
+ * @brief 将导航参考值写进来
+ */
+void MsckfVio::ReferenceCallback(const nav_msgs::Odometry::Ptr  &reference_msg)
+{
+    // ROS_INFO("=============== 2 Reference Navigation States OK ========================");
+    // 基于IMU的重力初始化标志，开始导航状态的初始化处理
+    if (!is_gyrobias_set) return;
+
+    Vector3d init_att = Vector3d::Zero();
+    Vector3d init_vel = Vector3d::Zero();
+    Vector3d init_pos = Vector3d::Zero();
+
+    if (!is_state_initial){
+
+        // 使用自定义的消息类型转换（针对618Dpro旧的数据定义）
+        MsckfVio::ForsenseMsgAttiNewToEigen(reference_msg, init_att);
+        MsckfVio::ForsenseMsgVeloNewToEigen(reference_msg, init_vel);
+        MsckfVio::ForsenseMsgPosiNewToEigen(reference_msg, init_pos);
 
         // 得出姿态，速度，位置（相当于最后的参考值作为初始化处理）
         state_server.imu_state.AttN = init_att;
-        // state_server.imu_state.AttN << init_att[0],init_att[1], 360.0 - init_att[2]; // 618Dpro定义的航向角符合顺时针为+，所以不需要进行转换  --2023-05-03
-        // state_server.imu_state.velocity = init_vel; 
-        state_server.imu_state.velocity << init_vel[1],init_vel[0], -init_vel[2]; // 注意618Dpro录制的是ned三方向速度，这里需要改成ENU三方向的速度
+        // state_server.imu_state.velocity << init_vel[1],init_vel[0], -init_vel[2]; // 注意618Dpro录制的是ned三方向速度，这里需要改成ENU三方向的速度
+        state_server.imu_state.velocity << init_vel; // 已经改成ENU三方向的速度
         state_server.imu_state.position = init_pos;
-        // state_server.imu_state.position << init_pos[1]/1E7,init_pos[0]/1E7,init_pos[2]/1E3; //统一格式为经纬高（deg,deg,m）
 
         // 2023-05-04 同步将初值进行记录
         state_server.imu_state.init_att_618Dpro = init_att;
-        state_server.imu_state.init_vel_618Dpro << init_vel[1],init_vel[0], -init_vel[2];
-        // state_server.imu_state.init_pos_618Dpro << init_pos[1]/1E7,init_pos[0]/1E7,init_pos[2]/1E3;
+        state_server.imu_state.init_vel_618Dpro << init_vel;
         state_server.imu_state.init_pos_618Dpro << init_pos;
 
-        // 同时给IMU进行时间赋值，这样便于后续的IMU迭代
-        // m_time_618Dpro_s = m_time_618Dpro/1000.0;
-        m_time_618Dpro_s = m_time_618Dpro; //时间重新在ForsenseMsgTimeToDouble转换完成，所以这里不用转换了
-        state_server.imu_state.time = m_time_618Dpro_s; // 统一单位为s
-        cout<<"====================Time run here==========="<<__LINE__<<endl;
-        ROS_INFO("===================size Zero_Second========================");
-        ROS_INFO("my_time show 2: %f ", m_time_618Dpro_s);
-        ROS_INFO("==========================over================================");
-
-        ROS_INFO("===============START IMU INIT========================");
-
-        // 由于显示精度的问题，这里用cout
-        std::cout<<setprecision(20)<<"initial attitude : attix="<<state_server.imu_state.AttN[0]<<",attiy="<<state_server.imu_state.AttN[1]<<",attiz="<<state_server.imu_state.AttN[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"initial velocity : velox="<<state_server.imu_state.velocity[0]<<",veloy="<<state_server.imu_state.velocity[1]<<",veloz="<<state_server.imu_state.velocity[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"initial position : posix="<<state_server.imu_state.position[0]<<",posiy="<<state_server.imu_state.position[1]<<",posiz="<<state_server.imu_state.position[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"initial time : time="<<state_server.imu_state.time<<std::endl;  
-        
-        ROS_INFO("=====================end=============================");
         is_state_initial = true;
-
-                                                  
+        ROS_INFO("=============== 2.1 Navigation States INIT OK ========================");
     }
-    else
-    {
-
-        // 618Dpro中消息的读取
-        MsckfVio::ForsenseMsgGyroToEigen(msg_copy, m_gyro_618Dpro);
-        MsckfVio::ForsenseMsgAccToEigen(msg_copy, m_acc_618Dpro);
-        MsckfVio::ForsenseMsgTimeToDouble(msg_copy, m_time_618Dpro);
-        // 将时间也记录下来
-        // m_time_618Dpro_s = m_time_618Dpro/1000.0;
-        m_time_618Dpro_s = m_time_618Dpro; //时间重新在ForsenseMsgTimeToDouble转换完成，所以这里不用转换了
-
-        // cout<<"====================Time run here==========="<<__LINE__<<endl;
-        // ROS_INFO("===================size Zero_Second========================");
-        // ROS_INFO("my_time show 3: %f ", m_time_618Dpro_s);
-        // ROS_INFO("last_my_time show 3: %f ", state_server.imu_state.time);
-        // ROS_INFO("==========================over================================");
-
-        double g=9.7803698;         // 重力加速度
-        // 注意原有算法中角速度和加速度三轴是符合FLU的顺序，这里需要改成符合松组合算法的RFU三轴定义，所以对角速度和加速度进行转换处理
-        // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];  // （rad/s）注意这里的z轴旋转角速度是要符合逆时针旋转为+的顺序（与航向角符合顺时针为+的顺序不同）,且符合RFU三轴的顺序定义
-        m_gyro_618Dpro_RFU << m_gyro_618Dpro;  // （deg/s）注意已经在头文件实现了转换
-        m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU;  // （deg/s）注意已经在头文件实现了转换
-
-        // m_acc_618Dpro_RFU << -m_acc_618Dpro[1], m_acc_618Dpro[0], m_acc_618Dpro[2];
-        m_acc_618Dpro_RFU << m_acc_618Dpro; //（m/s/s） 注意已经在头文件实现了转换
-        m_acc_618Dpro_RFU_mss = m_acc_618Dpro_RFU;  // （m/s/s）
-
-        // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
-        // m_acc_618Dpro_RFU_mss = m_acc_618Dpro_RFU * g;  // （m/s/s）
-        
-        // 这里是实现地理系下的IMU的参数迭代处理，主要包括IMU的零偏修正，状态更新
-        // Remove the bias from the measured gyro and acceleration
-        // IMUState& imu_state = state_server.imu_state;
-        my_gyro = m_gyro_618Dpro_RFU_deg - state_server.imu_state.gyros_bias - state_server.imu_state.gyros_markov_bias - state_server.imu_state.gyrosOffset;
-        my_acc = m_acc_618Dpro_RFU_mss - state_server.imu_state.acc_markov_bias;
-        my_dtime = m_time_618Dpro_s - state_server.imu_state.time;
-
-        cout<<"====================Time run here==========="<<__LINE__<<endl;
-        ROS_INFO("==============================================================");
-        ROS_INFO("==============================================================");
-        ROS_INFO("===================Record the IMU data========================");
-        ROS_INFO("===================0 acc and gyro bias =======================");
-        ROS_INFO("==============================================================");
-        std::cout<<setprecision(20)<<"input gyro : gyrox="<<m_gyro_618Dpro_RFU_deg[0] * 3.14159265358979/180.0 <<",gyroy="<<m_gyro_618Dpro_RFU_deg[1]  * 3.14159265358979/180.0 <<",gyroz="<<m_gyro_618Dpro_RFU_deg[2]  * 3.14159265358979/180.0 <<std::endl;  
-
-        std::cout<<setprecision(20)<<"gyro : gyrox="<<my_gyro[0]<<",gyroy="<<my_gyro[1]<<",gyroz="<<my_gyro[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"gyros_bias : gyros_biasx="<<state_server.imu_state.position[0]<<",gyros_biasy="<<state_server.imu_state.position[1]<<",gyros_biasz="<<state_server.imu_state.position[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"gyros_markov_bias : gyros_markov_biasx="<<state_server.imu_state.position[0]<<",gyros_markov_biasy="<<state_server.imu_state.position[1]<<",gyros_markov_biasz="<<state_server.imu_state.position[2]<<std::endl;  
-
-        std::cout<<setprecision(20)<<"input acc : accx="<<m_acc_618Dpro_RFU_mss[0]/g<<",accy="<<m_acc_618Dpro_RFU_mss[1]/g<<",accz="<<m_acc_618Dpro_RFU_mss[2]/g<<std::endl;  
-        std::cout<<setprecision(20)<<"acc : accx="<<my_acc[0]<<",accy="<<my_acc[1]<<",accz="<<my_acc[2]<<std::endl;
-        std::cout<<setprecision(20)<<"acc : accx="<<state_server.imu_state.acc_markov_bias[0]<<",accy="<<state_server.imu_state.acc_markov_bias[1]<<",accz="<<state_server.imu_state.acc_markov_bias[2]<<std::endl;  
-      
-        std::cout<<setprecision(20)<<"time : time="<<state_server.imu_state.time<<std::endl; 
-
-        std::ofstream outfile3;
-        outfile3.open("/home/wang/local/MATLAB2023/work/618Dpro_data_process/gyro_results1_VSCODE.txt",std::ios::app);
-        // outfile<<setprecision(10)<<INS-&gt;PosN(0)-Z(1)/deg2rad/(Rn+height)/cos(latitude) <<","<<INS-&gt;PosN(1)-Z(0)/deg2rad/(Rm+height)<<","<<INS-&gt;PosN(2)-Z(2)<<endl;
-        outfile3<<std::setprecision(20)<<m_gyro_618Dpro_RFU_deg[0] * 3.14159265358979/180.0 <<","<<m_gyro_618Dpro_RFU_deg[1] * 3.14159265358979/180.0<<","<<m_gyro_618Dpro_RFU_deg[2] * 3.14159265358979/180.0<<","<< state_server.imu_state.gyros_bias[0] <<","<<state_server.imu_state.gyros_bias[1] <<","<<state_server.imu_state.gyros_bias[2] <<","<< state_server.imu_state.gyros_markov_bias[0] <<","<<state_server.imu_state.gyros_markov_bias[1] <<","<<state_server.imu_state.gyros_markov_bias[2]<<","<< state_server.imu_state.gyrosOffset[0] <<","<<state_server.imu_state.gyrosOffset[1] <<","<<state_server.imu_state.gyrosOffset[2]<<std::endl;
-        outfile3.close();
-
-        std::ofstream outfile4;
-        outfile4.open("/home/wang/local/MATLAB2023/work/618Dpro_data_process/acc_results1_VSCODE.txt",std::ios::app);
-        // outfile<<setprecision(10)<<INS-&gt;PosN(0)-Z(1)/deg2rad/(Rn+height)/cos(latitude) <<","<<INS-&gt;PosN(1)-Z(0)/deg2rad/(Rm+height)<<","<<INS-&gt;PosN(2)-Z(2)<<endl;
-        outfile4<<std::setprecision(20)<<m_acc_618Dpro_RFU_mss[0]/g <<","<<m_acc_618Dpro_RFU_mss[1]/g<<","<<m_acc_618Dpro_RFU_mss[2]/g<<","<< state_server.imu_state.acc_markov_bias[0] <<","<<state_server.imu_state.acc_markov_bias[1] <<","<<state_server.imu_state.acc_markov_bias[2] <<std::endl;
-        outfile4.close(); 
-
-        // Update the state info
-        state_server.imu_state.time = m_time_618Dpro_s;
-
-        // cout<<"====================Time run here==========="<<__LINE__<<endl;
-        // ROS_INFO("===================size Zero_Second========================");
-        // ROS_INFO("my_time update 4: %f ", state_server.imu_state.time);
-        // ROS_INFO("==========================over================================");
-        // ROS_INFO("my_dtime: %f ", my_dtime);
-        // ROS_INFO("==========================over================================");
 
 
-        INS_Update();       // 第一步：利用IMU的实现运动状态更新
+}
 
-        cout<<"====================Time run here==========="<<__LINE__<<endl;
-        ROS_INFO("==============================================================");
-        ROS_INFO("==============================================================");
-        ROS_INFO("===================Start the INS record=======================");
-        ROS_INFO("===================1 Paraments input==========================");
-        ROS_INFO("==============================================================");
-        ROS_INFO("my_datacount show : %d ", dataCount);
-        // std::cout<<"my_datacount show "<<dataCount<<std::endl;
-        ROS_INFO("my_time show : %f ", m_time_618Dpro_s);
-        ROS_INFO("my_gyro show : %f %f %f", my_gyro[0],my_gyro[1],my_gyro[2]);
-        ROS_INFO("my_acc show : %f %f %f", my_acc[0],my_acc[1],my_acc[2]);
-        ROS_INFO("===============navigation states ========================");
-        // 由于显示精度的问题，这里用cout
-        std::cout<<setprecision(20)<<"attitude : attix="<<state_server.imu_state.AttN[0]<<",attiy="<<state_server.imu_state.AttN[1]<<",attiz="<<state_server.imu_state.AttN[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"velocity : velox="<<state_server.imu_state.velocity[0]<<",veloy="<<state_server.imu_state.velocity[1]<<",veloz="<<state_server.imu_state.velocity[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"position : posix="<<state_server.imu_state.position[0]<<",posiy="<<state_server.imu_state.position[1]<<",posiz="<<state_server.imu_state.position[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"time : time="<<state_server.imu_state.time<<std::endl;  
-        ROS_INFO("=====================end=================================");
-        
-        system_model_cal();           // 第二步：构建运动模型
+// 2023-04-29 基于旧的消息类型定义下的GPS数据提取代码
+// GPS fusion part
+// void MsckfVio::GPSCallback(const forsense_msg::Forsense::Ptr & gps_msg)
+void MsckfVio::GPSCallback(const sensor_msgs::NavSatFix::Ptr &gps_msg)
+{
+    // // ROS_INFO("START GPS DATA...");
+    // // double time = gps_msg->header.stamp.toSec();
+    // // 2023-04-29 注意由于原有的消息类型中没有加入ROS时间戳的记录，所以只能用自带的UTC/GPS时间进行处理
+    // unsigned int time = gps_msg->time_gps_ms;
+    // double time_trans = static_cast<double>(time)/1000.0;
 
-        //卡尔曼滤波时间更新和状态更新
-        my_Xestimated = Eigen::VectorXd::Zero(18);
+    // // cout<<"====================Time run here==========="<<__LINE__<<endl;
+    // // ROS_INFO("===================size Zero_Second========================");
+    // // ROS_INFO("my_time show 1: %f ", time_trans);
+    // // ROS_INFO("==========================over================================");
 
-        // ROS_INFO("===================size Zero_One========================");
-        // // std::cout<<"size of Pestimated: "<<Pestimated.rows()<<std::endl;
-        // ROS_INFO("state_server.state_cov dimensions: %d x %d", state_server.state_cov.rows(), state_server.state_cov.cols());
-        // ROS_INFO("==========================over================================");
+    // // ---------------------------------------------------------------------------
+    // // 2023-04-30 继续进行初始化处理，状态传递，状态观测，修正处理，状态输出等部分内容的处理
 
-        // 将MSCKF的协方差与松组合的协方差进行关联
-        my_Pestimated = state_server.state_cov;
+    // // 1、进行状态初始化处理(参考值传输过来实现)
+    // forsense_msg::Forsense msg_copy;
+    // msg_copy=(*gps_msg);
+    // // 实现对IMU参数的记录
+    // msg_copy.accel = gps_msg->accel;
+    // msg_copy.gyro = gps_msg->gyro;
 
-        // ROS_INFO("===================size Zero_Second========================");
-        // // std::cout<<"size of Pestimated: "<<Pestimated.rows()<<std::endl;
-        // ROS_INFO("my_Pestimated dimensions: %d x %d", my_Pestimated.rows(), my_Pestimated.cols());
-        // ROS_INFO("==========================over================================");
+    // IMU_couter_buffer.push_back(msg_copy);
 
+    // forsense_msg::Forsense msg_copy2;
+    // msg_copy2.time_gps_ms = gps_msg->time_gps_ms;
+    // msg_copy2.pos = gps_msg->pos;
+    // msg_copy2.vel = gps_msg->vel;
+    // msg_copy2.att = gps_msg->att;
+    // // 这里将角速度和加速度也一并给过来，这样用来进行初始的姿态固定偏差静止估计
+    // msg_copy2.accel = gps_msg->accel;
+    // msg_copy2.gyro = gps_msg->gyro;
 
-        // ROS_INFO("===================Xestimated========================");
-        // ROS_INFO("Xestimated(0): %f", Xestimated(0));
-        // ROS_INFO("Xestimated(1): %f", Xestimated(1));
-        // ROS_INFO("Xestimated(2): %f", Xestimated(2));
-        // ROS_INFO("Xestimated(3): %f", Xestimated(3));
-        // ROS_INFO("Xestimated(4): %f", Xestimated(4));
-        // ROS_INFO("Xestimated(5): %f", Xestimated(5));
-        // ROS_INFO("Xestimated(6): %f", Xestimated(6));
-        // ROS_INFO("Xestimated(7): %f", Xestimated(7));
-        // ROS_INFO("Xestimated(8): %f", Xestimated(8));
-        // ROS_INFO("Xestimated(9): %f", Xestimated(9));
-        // ROS_INFO("Xestimated(10): %f", Xestimated(10));
-        // ROS_INFO("Xestimated(11): %f", Xestimated(11));
-        // ROS_INFO("Xestimated(12): %f", Xestimated(12));
-        // ROS_INFO("Xestimated(13): %f", Xestimated(13));
-        // ROS_INFO("Xestimated(14): %f", Xestimated(14));
-        // ROS_INFO("Xestimated(15): %f", Xestimated(15));
-        // ROS_INFO("Xestimated(16): %f", Xestimated(16));
-        // ROS_INFO("Xestimated(17): %f", Xestimated(17));
-        // ROS_INFO("==========================over================================");
+    // // 2023-05--07 新增对618Dpro拟合状态量的输出
+    // ofstream outfile1;
+    // outfile1.open("/home/wang/local/MATLAB2023/work/618Dpro_data_process/RTK_result_MSCKF1.txt",ios::app);
+    // outfile1<<setprecision(20)<<msg_copy2.att[0]<<','<<msg_copy2.att[1]<<','<<msg_copy2.att[2]<<','<<msg_copy2.vel[0]<<','<<msg_copy2.vel[1]<<','<<msg_copy2.vel[2]<<','<<msg_copy2.pos[0]<<','<<msg_copy2.pos[1]<<','<<msg_copy2.pos[2]<<endl;
+    // outfile1.close();
 
-        // KF_time_update(Xestimated,Pestimated,F,Q_noise);                                                           // 第三步：基于模型实现状态,协方差的运动迭代
-        
-        // Eigen::MatrixXd Temp_0 = F*Pestimated*(F.transpose());
-        // Eigen::MatrixXd Temp_0 = my_F;
+    // // cout<<"====================Time run here==========="<<__LINE__<<endl;
+    // // ROS_INFO("===================size Zero_Second========================");
+    // // ROS_INFO("my_time show 1.1: %d ", msg_copy2.time_gps_ms);
+    // // ROS_INFO("==========================over================================");
 
-        // std::stringstream ss_Temp_0;
-        // ss_Temp_0 << Temp_0;
-        // ROS_INFO("=====================ss_Temp_0========================");
-        // ROS_INFO("Matrix:\n%s", ss_Temp_0.str().c_str());
-        // ROS_INFO("==========================over================================");
-        
-        
-        my_Xestimated = my_F*my_Xestimated;
+    // Tru_couter_buffer.push_back(msg_copy2);
+    
+    static int dataCount = 0;                                           // 计数，用于观测修正
+    dataCount++;
 
-        std::stringstream ss_Temp_my_Pestimated_before;
-        ss_Temp_my_Pestimated_before << my_Pestimated;
-        cout<<"====================Time run here==========="<<__LINE__<<endl;
-        ROS_INFO("=====================ss_Temp_my_Pestimated_before(process)========================");
-        ROS_INFO("Matrix:\n%s", ss_Temp_my_Pestimated_before.str().c_str());
-        ROS_INFO("==========================over================================");
+    ROS_INFO("dataCount: %d ", dataCount);
 
-        my_Pestimated = my_F*my_Pestimated*(my_F.transpose()) + my_Q;
-
-        std::stringstream ss_Temp_my_Pestimated_after;
-        ss_Temp_my_Pestimated_after << my_Pestimated;
-        cout<<"====================Time run here==========="<<__LINE__<<endl;
-        ROS_INFO("=====================ss_Temp_my_Pestimated_after(process)========================");
-        ROS_INFO("Matrix:\n%s", ss_Temp_my_Pestimated_after.str().c_str());
-        ROS_INFO("==========================over================================");
-        ROS_INFO("=====================3 kalman prediction finish=============================");
-
-        Eigen::MatrixXd Temp_0F = my_F;
-        std::stringstream ss_Temp_0F;
-        ss_Temp_0F << Temp_0F;
-        ROS_INFO("=====================ss_my_F(process)========================");
-        ROS_INFO("Matrix:\n%s", ss_Temp_0F.str().c_str());
-        ROS_INFO("==========================over================================");
-
-        std::stringstream ss_my_Q;
-        ss_my_Q << my_Q;
-        ROS_INFO("=====================ss_my_Q(process)========================");
-        ROS_INFO("Matrix:\n%s", ss_my_Q.str().c_str());
-        ROS_INFO("==========================over================================");
+    if (!is_state_initial)  return;
 
 
-        // ROS_INFO("===================size One========================");
-        // // std::cout<<"size of Pestimated: "<<Pestimated.rows()<<std::endl;
-        // ROS_INFO("Pestimated dimensions: %d x %d", my_Pestimated.rows(), my_Pestimated.cols());
-        // ROS_INFO("==========================over================================");
+    ROS_INFO("=============== 3.1 GPS process start ========================");
+    // 打印IMU的消息
+    for (size_t i = 0; i < imu_msg_buffer.size(); i++) {
+        sensor_msgs::Imu msg = imu_msg_buffer[i];
+        // 打印消息的内容
+        std::cout << "IMU Message " << i << ":" << std::endl;
+        // 根据 sensor_msgs::Imu 消息的具体字段，打印相应内容
+        std::cout << "Field 1:time " << msg.header.stamp << std::endl;
+        std::cout << "Field 2:gyro_x " << msg.angular_velocity.x <<",Field 2:gyro_y "<< msg.angular_velocity.y <<",Field 2:gyro_z "<< msg.angular_velocity.z << std::endl;
+        std::cout << "Field 2:acc_x " << msg.linear_acceleration.x << "Field 2:acc_y " << msg.linear_acceleration.y << "Field 2:acc_z " << msg.linear_acceleration.z << std::endl;
+        // ...
+    }
 
-        dataCount++;
-        cout<<"====================Time run here==========="<<__LINE__<<endl;
-        ROS_INFO("==============================================================");
-        ROS_INFO("==============================================================");
-        ROS_INFO("===================2 states process===========================");
-        ROS_INFO("==============================================================");
-        ROS_INFO("my_time show : %f ", state_server.imu_state.time );
-        // ROS_INFO("my_gyro show : %f %f %f", my_gyro[0],my_gyro[1],my_gyro[2]);
-        // ROS_INFO("my_acc show : %f %f %f", my_acc[0],my_acc[1],my_acc[2]);
-        ROS_INFO("===============navigation states ========================");
-        // 由于显示精度的问题，这里用cout
-        std::cout<<setprecision(20)<<"attitude : attix="<<state_server.imu_state.AttN[0]<<",attiy="<<state_server.imu_state.AttN[1]<<",attiz="<<state_server.imu_state.AttN[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"velocity : velox="<<state_server.imu_state.velocity[0]<<",veloy="<<state_server.imu_state.velocity[1]<<",veloz="<<state_server.imu_state.velocity[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"position : posix="<<state_server.imu_state.position[0]<<",posiy="<<state_server.imu_state.position[1]<<",posiz="<<state_server.imu_state.position[2]<<std::endl;  
-        std::cout<<setprecision(20)<<"time : time="<<state_server.imu_state.time<<std::endl;
-        ROS_INFO("===============coveriance ========================");  
-        std::stringstream ss_coveriance;
-        ss_coveriance << my_Pestimated;
-        ROS_INFO("=====================ss_Temp========================");
-        ROS_INFO("my_Pestimated Matrix:\n%s", ss_coveriance.str().c_str());
-        ROS_INFO("===================Xestimated========================");
-        std::stringstream ss_Xestimated;
-        ss_Xestimated << my_Xestimated;
-        ROS_INFO("=====================ss_Temp========================");
-        ROS_INFO("my_Xestimated Matrix:\n%s", ss_Xestimated.str().c_str());
-        ROS_INFO("==========================over================================");
+    if (is_first_GPS) {
+        is_first_GPS = false;
+        state_server.imu_state.time = gps_msg->header.stamp.toSec();
+        ROS_INFO("=============== 3.0 state_server.imu_state  init ok  ========================");
+    }
 
+    if (is_state_initial) {
+        ROS_INFO("=============== INIT OK , WAIT GPS process========================");
 
-        if(dataCount>=10) // 100Hz频率下 1s更新一次
-        {
-            dataCount = 0;
-            // 618Dpro中消息的读取（GPS的位置）
-            MsckfVio::ForsenseMsgGpsPosiToEigen(msg_copy, m_posi_GPS_618Dpro);
-            // 注意由于msg中单位没有转换过来，这里进行转换处理
-            Eigen::Vector3d m_posi_GPS(m_posi_GPS_618Dpro[0]/1E7,m_posi_GPS_618Dpro[1]/1E7,m_posi_GPS_618Dpro[2]/1E3); //统一格式为经纬高（deg,deg,m）
+        // 设定好时间处理
+        int used_imu_msg_cntr = 0;
 
-            measur_model_cal(m_posi_GPS);                                                            // 第四步：构建观测模型
+        double time_bound = gps_msg->header.stamp.toSec();   // 当前GPS的时间戳
 
-            // std::stringstream ss_Pestimated;
-            // ss_Pestimated << my_Pestimated;
-            // ROS_INFO("=====================Pestimated========================");
-            // ROS_INFO("Matrix:\n%s", ss_Pestimated.str().c_str());
-            // ROS_INFO("==========================over================================");
+        for (const auto& imu_msg : imu_msg_buffer) {
+            double imu_time = imu_msg.header.stamp.toSec();
+            if (imu_time < state_server.imu_state.time) {
+                ++used_imu_msg_cntr;
+                continue;
+            }
+            if (imu_time > time_bound) break;
 
-            KF_meas_update();                                                           // 第五步：实现观测修正处理
+            // // Execute process model.
+            // processModel(imu_time, m_gyro, m_acc);
 
-            ROS_INFO("============================================================GPS correction===================================================================");
-            cout<<"====================Time run here==========="<<__LINE__<<endl;
-            ROS_INFO("==============================================================");
-            ROS_INFO("==============================================================");
-            ROS_INFO("===================3 measurment estimation====================");
-            ROS_INFO("==============================================================");
-            ROS_INFO("my_time show : %f ", state_server.imu_state.time );
-            // ROS_INFO("my_gyro show : %f %f %f", my_gyro[0],my_gyro[1],my_gyro[2]);
-            // ROS_INFO("my_acc show : %f %f %f", my_acc[0],my_acc[1],my_acc[2]);
-            ROS_INFO("===============navigation states ========================");
-            // 由于显示精度的问题，这里用cout
-            std::cout<<setprecision(20)<<"attitude : attix="<<state_server.imu_state.AttN[0]<<",attiy="<<state_server.imu_state.AttN[1]<<",attiz="<<state_server.imu_state.AttN[2]<<std::endl;  
-            std::cout<<setprecision(20)<<"velocity : velox="<<state_server.imu_state.velocity[0]<<",veloy="<<state_server.imu_state.velocity[1]<<",veloz="<<state_server.imu_state.velocity[2]<<std::endl;  
-            std::cout<<setprecision(20)<<"position : posix="<<state_server.imu_state.position[0]<<",posiy="<<state_server.imu_state.position[1]<<",posiz="<<state_server.imu_state.position[2]<<std::endl;  
-            std::cout<<setprecision(20)<<"time : time="<<state_server.imu_state.time<<std::endl;
-            ROS_INFO("===============coveriance ========================");  
-            std::stringstream ss_coveriance3;
-            ss_coveriance3 << my_Pestimated;
-            ROS_INFO("=====================ss_Temp========================");
-            ROS_INFO("my_Pestimated Matrix:\n%s", ss_coveriance3.str().c_str());
-            ROS_INFO("===================Xestimated========================");
-            std::stringstream ss_Xestimated3;
-            ss_Xestimated3 << my_Xestimated;
-            ROS_INFO("=====================ss_Temp========================");
-            ROS_INFO("my_Xestimated Matrix:\n%s", ss_Xestimated3.str().c_str());
-            ROS_INFO("==========================over================================");
+            // Update the state info
+            state_server.imu_state.time = imu_time;
 
-            ROS_INFO("=====================6.1 error correction calculated complete=============================");
-
-            // INS_Correction(PosError,VelError,AttError);
-            INS_Correction(); 
-
-            cout<<"====================Time run here==========="<<__LINE__<<endl;
-            ROS_INFO("==============================================================");
-            ROS_INFO("==============================================================");
-            ROS_INFO("===================4 states update============================");
-            ROS_INFO("==============================================================");
-            ROS_INFO("my_time show : %f ", state_server.imu_state.time );
-            // ROS_INFO("my_gyro show : %f %f %f", my_gyro[0],my_gyro[1],my_gyro[2]);
-            // ROS_INFO("my_acc show : %f %f %f", my_acc[0],my_acc[1],my_acc[2]);
-            ROS_INFO("===============navigation states ========================");
-            // 由于显示精度的问题，这里用cout
-            std::cout<<setprecision(20)<<"attitude : attix="<<state_server.imu_state.AttN[0]<<",attiy="<<state_server.imu_state.AttN[1]<<",attiz="<<state_server.imu_state.AttN[2]<<std::endl;  
-            std::cout<<setprecision(20)<<"velocity : velox="<<state_server.imu_state.velocity[0]<<",veloy="<<state_server.imu_state.velocity[1]<<",veloz="<<state_server.imu_state.velocity[2]<<std::endl;  
-            std::cout<<setprecision(20)<<"position : posix="<<state_server.imu_state.position[0]<<",posiy="<<state_server.imu_state.position[1]<<",posiz="<<state_server.imu_state.position[2]<<std::endl;  
-            std::cout<<setprecision(20)<<"time : time="<<state_server.imu_state.time<<std::endl;
-            ROS_INFO("===============coveriance ========================");  
-            std::stringstream ss_coveriance4;
-            ss_coveriance4 << my_Pestimated;
-            ROS_INFO("=====================ss_Temp========================");
-            ROS_INFO("my_Pestimated Matrix:\n%s", ss_coveriance4.str().c_str());
-            ROS_INFO("===================Xestimated========================");
-            std::stringstream ss_Xestimated4;
-            ss_Xestimated4 << my_Xestimated;
-            ROS_INFO("=====================ss_Temp========================");
-            ROS_INFO("my_Xestimated Matrix:\n%s", ss_Xestimated4.str().c_str());
-            ROS_INFO("==========================over================================");
-
-            // publish_loose(msg_copy2);  
-
+            ++used_imu_msg_cntr;
         }
 
-        // 修正后的协方差进行状态传递
-        state_server.state_cov = my_Pestimated;
+        // Remove all used IMU msgs.
+        imu_msg_buffer.erase(imu_msg_buffer.begin(),
+                            imu_msg_buffer.begin()+used_imu_msg_cntr);
+    };
 
-        publish_loose(msg_copy2);                                                                                   // 第六步：相关消息的发布
 
+    ROS_INFO("=============== 3.2 GPS process end ========================");
+    // 打印IMU的消息
+    for (size_t i = 0; i < imu_msg_buffer.size(); i++) {
+        sensor_msgs::Imu msg = imu_msg_buffer[i];
+        // 打印消息的内容
+        std::cout << "IMU Message " << i << ":" << std::endl;
+        // 根据 sensor_msgs::Imu 消息的具体字段，打印相应内容
+        std::cout << "Field 1:time " << msg.header.stamp << std::endl;
+        std::cout << "Field 2:gyro_x " << msg.angular_velocity.x <<",Field 2:gyro_y "<< msg.angular_velocity.y <<",Field 2:gyro_z "<< msg.angular_velocity.z << std::endl;
+        std::cout << "Field 2:acc_x " << msg.linear_acceleration.x << "Field 2:acc_y " << msg.linear_acceleration.y << "Field 2:acc_z " << msg.linear_acceleration.z << std::endl;
+        // ...
     }
+
+
+
+    
+    // // {
+
+    // //     static int dataCount = 0; 
+    // //     dataCount++;
+
+    // //     if (IMU_couter_buffer.size() < 50) return;
+    // //     // INS_Inialization();
+    // //     // 这里是直接将姿态、速度、位置直接拿出来进行处理
+    // //     Vector3d atti_conference = Vector3d::Zero();
+    // //     Vector3d vel_conference = Vector3d::Zero();
+    // //     Vector3d posi_conference = Vector3d::Zero();
+
+    // //     Vector3d init_att = Vector3d::Zero();
+    // //     Vector3d init_vel = Vector3d::Zero();
+    // //     Vector3d init_pos = Vector3d::Zero();
+
+    // //     double m_time_618Dpro, m_time_618Dpro_s;                            // 原始的618Dpro记载的缺少了ROS时间戳，所以这里是拿GPS时间来处理
+
+    // //     // 所以这里不应该拿IMU的速度，而应该拿参考值部分的消息内容
+    // //     for (const auto &gps_msg : Tru_couter_buffer)
+    // //     {
+
+    // //         // 使用自定义的消息类型转换（针对618Dpro旧的数据定义）
+    // //         MsckfVio::ForsenseMsgAttiToEigen(gps_msg, init_att);
+    // //         MsckfVio::ForsenseMsgVeloToEigen(gps_msg, init_vel);
+    // //         MsckfVio::ForsenseMsgPosiToEigen(gps_msg, init_pos);
+
+    // //         MsckfVio::ForsenseMsgTimeToDouble(gps_msg, m_time_618Dpro);
+
+    // //         // // 对初始静止情况下IMU数据进行累积，用于后续估计
+    // //         // MsckfVio::ForsenseMsgGyroToEigen(gps_msg, m_gyro_618Dpro);
+    // //         // 对初始静止情况下IMU数据进行累积，用于后续估计(这里用rad，便于对比初始gyro，分析是第多少的数据)
+    // //         MsckfVio::ForsenseMsgGyroRadToEigen(gps_msg, m_gyro_618Dpro);
+    // //         state_server.imu_state.gyrosOffset += m_gyro_618Dpro * rad2deg;           // 将各个静止下的角速度进行累积，从而求得静止下的角速度零偏
+    // //     }
+
+    // //     // 基于给入消息的数量，最终求得平均
+    // //     state_server.imu_state.gyrosOffset /= double(dataCount);
+
+    // //     // 得出姿态，速度，位置（相当于最后的参考值作为初始化处理）
+    // //     state_server.imu_state.AttN = init_att;
+    // //     // state_server.imu_state.AttN << init_att[0],init_att[1], 360.0 - init_att[2]; // 618Dpro定义的航向角符合顺时针为+，所以不需要进行转换  --2023-05-03
+    // //     // state_server.imu_state.velocity = init_vel; 
+    // //     state_server.imu_state.velocity << init_vel[1],init_vel[0], -init_vel[2]; // 注意618Dpro录制的是ned三方向速度，这里需要改成ENU三方向的速度
+    // //     state_server.imu_state.position = init_pos;
+    // //     // state_server.imu_state.position << init_pos[1]/1E7,init_pos[0]/1E7,init_pos[2]/1E3; //统一格式为经纬高（deg,deg,m）
+
+    // //     // 2023-05-04 同步将初值进行记录
+    // //     state_server.imu_state.init_att_618Dpro = init_att;
+    // //     state_server.imu_state.init_vel_618Dpro << init_vel[1],init_vel[0], -init_vel[2];
+    // //     // state_server.imu_state.init_pos_618Dpro << init_pos[1]/1E7,init_pos[0]/1E7,init_pos[2]/1E3;
+    // //     state_server.imu_state.init_pos_618Dpro << init_pos;
+
+    // //     // 同时给IMU进行时间赋值，这样便于后续的IMU迭代
+    // //     // m_time_618Dpro_s = m_time_618Dpro/1000.0;
+    // //     m_time_618Dpro_s = m_time_618Dpro; //时间重新在ForsenseMsgTimeToDouble转换完成，所以这里不用转换了
+    // //     state_server.imu_state.time = m_time_618Dpro_s; // 统一单位为s
+    // //     cout<<"====================Time run here==========="<<__LINE__<<endl;
+    // //     ROS_INFO("===================size Zero_Second========================");
+    // //     ROS_INFO("my_time show 2: %f ", m_time_618Dpro_s);
+    // //     ROS_INFO("==========================over================================");
+
+    // //     ROS_INFO("===============START IMU INIT========================");
+
+    // //     // 由于显示精度的问题，这里用cout
+    // //     std::cout<<setprecision(20)<<"initial attitude : attix="<<state_server.imu_state.AttN[0]<<",attiy="<<state_server.imu_state.AttN[1]<<",attiz="<<state_server.imu_state.AttN[2]<<std::endl;  
+    // //     std::cout<<setprecision(20)<<"initial velocity : velox="<<state_server.imu_state.velocity[0]<<",veloy="<<state_server.imu_state.velocity[1]<<",veloz="<<state_server.imu_state.velocity[2]<<std::endl;  
+    // //     std::cout<<setprecision(20)<<"initial position : posix="<<state_server.imu_state.position[0]<<",posiy="<<state_server.imu_state.position[1]<<",posiz="<<state_server.imu_state.position[2]<<std::endl;  
+    // //     std::cout<<setprecision(20)<<"initial time : time="<<state_server.imu_state.time<<std::endl;  
+        
+    // //     ROS_INFO("=====================end=============================");
+    // //     is_state_initial = true;
+                                                  
+    // // }
+    // // else
+    // // {
+
+    //     // 618Dpro中消息的读取
+    //     MsckfVio::ForsenseMsgGyroNewToEigen(imu_msg_buffer, m_gyro_618Dpro);
+    //     MsckfVio::ForsenseMsgAccNewToEigen(imu_msg_buffer, m_acc_618Dpro);
+    //     MsckfVio::ForsenseMsgTimeToDouble(imu_msg_buffer, m_time_618Dpro);
+    //     // 将时间也记录下来
+    //     // m_time_618Dpro_s = m_time_618Dpro/1000.0;
+    //     m_time_618Dpro_s = m_time_618Dpro; //时间重新在ForsenseMsgTimeToDouble转换完成，所以这里不用转换了
+
+    //     // cout<<"====================Time run here==========="<<__LINE__<<endl;
+    //     // ROS_INFO("===================size Zero_Second========================");
+    //     // ROS_INFO("my_time show 3: %f ", m_time_618Dpro_s);
+    //     // ROS_INFO("last_my_time show 3: %f ", state_server.imu_state.time);
+    //     // ROS_INFO("==========================over================================");
+
+    //     double g=9.7803698;         // 重力加速度
+    //     // 注意原有算法中角速度和加速度三轴是符合FLU的顺序，这里需要改成符合松组合算法的RFU三轴定义，所以对角速度和加速度进行转换处理
+    //     // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];  // （rad/s）注意这里的z轴旋转角速度是要符合逆时针旋转为+的顺序（与航向角符合顺时针为+的顺序不同）,且符合RFU三轴的顺序定义
+    //     m_gyro_618Dpro_RFU << m_gyro_618Dpro;  // （deg/s）注意已经在头文件实现了转换
+    //     m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU;  // （deg/s）注意已经在头文件实现了转换
+
+    //     // m_acc_618Dpro_RFU << -m_acc_618Dpro[1], m_acc_618Dpro[0], m_acc_618Dpro[2];
+    //     m_acc_618Dpro_RFU << m_acc_618Dpro; //（m/s/s） 注意已经在头文件实现了转换
+    //     m_acc_618Dpro_RFU_mss = m_acc_618Dpro_RFU;  // （m/s/s）
+
+    //     // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
+    //     // m_acc_618Dpro_RFU_mss = m_acc_618Dpro_RFU * g;  // （m/s/s）
+        
+    //     // 这里是实现地理系下的IMU的参数迭代处理，主要包括IMU的零偏修正，状态更新
+    //     // Remove the bias from the measured gyro and acceleration
+    //     // IMUState& imu_state = state_server.imu_state;
+    //     my_gyro = m_gyro_618Dpro_RFU_deg - state_server.imu_state.gyros_bias - state_server.imu_state.gyros_markov_bias - state_server.imu_state.gyrosOffset;
+    //     my_acc = m_acc_618Dpro_RFU_mss - state_server.imu_state.acc_markov_bias;
+    //     my_dtime = m_time_618Dpro_s - state_server.imu_state.time;
+
+    //     cout<<"====================Time run here==========="<<__LINE__<<endl;
+    //     ROS_INFO("==============================================================");
+    //     ROS_INFO("==============================================================");
+    //     ROS_INFO("===================Record the IMU data========================");
+    //     ROS_INFO("===================0 acc and gyro bias =======================");
+    //     ROS_INFO("==============================================================");
+    //     std::cout<<setprecision(20)<<"input gyro : gyrox="<<m_gyro_618Dpro_RFU_deg[0] * 3.14159265358979/180.0 <<",gyroy="<<m_gyro_618Dpro_RFU_deg[1]  * 3.14159265358979/180.0 <<",gyroz="<<m_gyro_618Dpro_RFU_deg[2]  * 3.14159265358979/180.0 <<std::endl;  
+
+    //     std::cout<<setprecision(20)<<"gyro : gyrox="<<my_gyro[0]<<",gyroy="<<my_gyro[1]<<",gyroz="<<my_gyro[2]<<std::endl;  
+    //     std::cout<<setprecision(20)<<"gyros_bias : gyros_biasx="<<state_server.imu_state.position[0]<<",gyros_biasy="<<state_server.imu_state.position[1]<<",gyros_biasz="<<state_server.imu_state.position[2]<<std::endl;  
+    //     std::cout<<setprecision(20)<<"gyros_markov_bias : gyros_markov_biasx="<<state_server.imu_state.position[0]<<",gyros_markov_biasy="<<state_server.imu_state.position[1]<<",gyros_markov_biasz="<<state_server.imu_state.position[2]<<std::endl;  
+
+    //     std::cout<<setprecision(20)<<"input acc : accx="<<m_acc_618Dpro_RFU_mss[0]/g<<",accy="<<m_acc_618Dpro_RFU_mss[1]/g<<",accz="<<m_acc_618Dpro_RFU_mss[2]/g<<std::endl;  
+    //     std::cout<<setprecision(20)<<"acc : accx="<<my_acc[0]<<",accy="<<my_acc[1]<<",accz="<<my_acc[2]<<std::endl;
+    //     std::cout<<setprecision(20)<<"acc : accx="<<state_server.imu_state.acc_markov_bias[0]<<",accy="<<state_server.imu_state.acc_markov_bias[1]<<",accz="<<state_server.imu_state.acc_markov_bias[2]<<std::endl;  
+      
+    //     std::cout<<setprecision(20)<<"time : time="<<state_server.imu_state.time<<std::endl; 
+
+    //     std::ofstream outfile3;
+    //     outfile3.open("/home/wang/local/MATLAB2023/work/618Dpro_data_process/gyro_results1_VSCODE.txt",std::ios::app);
+    //     // outfile<<setprecision(10)<<INS-&gt;PosN(0)-Z(1)/deg2rad/(Rn+height)/cos(latitude) <<","<<INS-&gt;PosN(1)-Z(0)/deg2rad/(Rm+height)<<","<<INS-&gt;PosN(2)-Z(2)<<endl;
+    //     outfile3<<std::setprecision(20)<<m_gyro_618Dpro_RFU_deg[0] * 3.14159265358979/180.0 <<","<<m_gyro_618Dpro_RFU_deg[1] * 3.14159265358979/180.0<<","<<m_gyro_618Dpro_RFU_deg[2] * 3.14159265358979/180.0<<","<< state_server.imu_state.gyros_bias[0] <<","<<state_server.imu_state.gyros_bias[1] <<","<<state_server.imu_state.gyros_bias[2] <<","<< state_server.imu_state.gyros_markov_bias[0] <<","<<state_server.imu_state.gyros_markov_bias[1] <<","<<state_server.imu_state.gyros_markov_bias[2]<<","<< state_server.imu_state.gyrosOffset[0] <<","<<state_server.imu_state.gyrosOffset[1] <<","<<state_server.imu_state.gyrosOffset[2]<<std::endl;
+    //     outfile3.close();
+
+    //     std::ofstream outfile4;
+    //     outfile4.open("/home/wang/local/MATLAB2023/work/618Dpro_data_process/acc_results1_VSCODE.txt",std::ios::app);
+    //     // outfile<<setprecision(10)<<INS-&gt;PosN(0)-Z(1)/deg2rad/(Rn+height)/cos(latitude) <<","<<INS-&gt;PosN(1)-Z(0)/deg2rad/(Rm+height)<<","<<INS-&gt;PosN(2)-Z(2)<<endl;
+    //     outfile4<<std::setprecision(20)<<m_acc_618Dpro_RFU_mss[0]/g <<","<<m_acc_618Dpro_RFU_mss[1]/g<<","<<m_acc_618Dpro_RFU_mss[2]/g<<","<< state_server.imu_state.acc_markov_bias[0] <<","<<state_server.imu_state.acc_markov_bias[1] <<","<<state_server.imu_state.acc_markov_bias[2] <<std::endl;
+    //     outfile4.close(); 
+
+    //     // Update the state info
+    //     state_server.imu_state.time = m_time_618Dpro_s;
+
+    //     // cout<<"====================Time run here==========="<<__LINE__<<endl;
+    //     // ROS_INFO("===================size Zero_Second========================");
+    //     // ROS_INFO("my_time update 4: %f ", state_server.imu_state.time);
+    //     // ROS_INFO("==========================over================================");
+    //     // ROS_INFO("my_dtime: %f ", my_dtime);
+    //     // ROS_INFO("==========================over================================");
+
+
+    //     INS_Update();       // 第一步：利用IMU的实现运动状态更新
+
+    //     cout<<"====================Time run here==========="<<__LINE__<<endl;
+    //     ROS_INFO("==============================================================");
+    //     ROS_INFO("==============================================================");
+    //     ROS_INFO("===================Start the INS record=======================");
+    //     ROS_INFO("===================1 Paraments input==========================");
+    //     ROS_INFO("==============================================================");
+    //     ROS_INFO("my_datacount show : %d ", dataCount);
+    //     // std::cout<<"my_datacount show "<<dataCount<<std::endl;
+    //     ROS_INFO("my_time show : %f ", m_time_618Dpro_s);
+    //     ROS_INFO("my_gyro show : %f %f %f", my_gyro[0],my_gyro[1],my_gyro[2]);
+    //     ROS_INFO("my_acc show : %f %f %f", my_acc[0],my_acc[1],my_acc[2]);
+    //     ROS_INFO("===============navigation states ========================");
+    //     // 由于显示精度的问题，这里用cout
+    //     std::cout<<setprecision(20)<<"attitude : attix="<<state_server.imu_state.AttN[0]<<",attiy="<<state_server.imu_state.AttN[1]<<",attiz="<<state_server.imu_state.AttN[2]<<std::endl;  
+    //     std::cout<<setprecision(20)<<"velocity : velox="<<state_server.imu_state.velocity[0]<<",veloy="<<state_server.imu_state.velocity[1]<<",veloz="<<state_server.imu_state.velocity[2]<<std::endl;  
+    //     std::cout<<setprecision(20)<<"position : posix="<<state_server.imu_state.position[0]<<",posiy="<<state_server.imu_state.position[1]<<",posiz="<<state_server.imu_state.position[2]<<std::endl;  
+    //     std::cout<<setprecision(20)<<"time : time="<<state_server.imu_state.time<<std::endl;  
+    //     ROS_INFO("=====================end=================================");
+        
+    //     system_model_cal();           // 第二步：构建运动模型
+
+    //     //卡尔曼滤波时间更新和状态更新
+    //     my_Xestimated = Eigen::VectorXd::Zero(18);
+
+    //     // ROS_INFO("===================size Zero_One========================");
+    //     // // std::cout<<"size of Pestimated: "<<Pestimated.rows()<<std::endl;
+    //     // ROS_INFO("state_server.state_cov dimensions: %d x %d", state_server.state_cov.rows(), state_server.state_cov.cols());
+    //     // ROS_INFO("==========================over================================");
+
+    //     // 将MSCKF的协方差与松组合的协方差进行关联
+    //     my_Pestimated = state_server.state_cov;
+
+    //     // ROS_INFO("===================size Zero_Second========================");
+    //     // // std::cout<<"size of Pestimated: "<<Pestimated.rows()<<std::endl;
+    //     // ROS_INFO("my_Pestimated dimensions: %d x %d", my_Pestimated.rows(), my_Pestimated.cols());
+    //     // ROS_INFO("==========================over================================");
+
+
+    //     // ROS_INFO("===================Xestimated========================");
+    //     // ROS_INFO("Xestimated(0): %f", Xestimated(0));
+    //     // ROS_INFO("Xestimated(1): %f", Xestimated(1));
+    //     // ROS_INFO("Xestimated(2): %f", Xestimated(2));
+    //     // ROS_INFO("Xestimated(3): %f", Xestimated(3));
+    //     // ROS_INFO("Xestimated(4): %f", Xestimated(4));
+    //     // ROS_INFO("Xestimated(5): %f", Xestimated(5));
+    //     // ROS_INFO("Xestimated(6): %f", Xestimated(6));
+    //     // ROS_INFO("Xestimated(7): %f", Xestimated(7));
+    //     // ROS_INFO("Xestimated(8): %f", Xestimated(8));
+    //     // ROS_INFO("Xestimated(9): %f", Xestimated(9));
+    //     // ROS_INFO("Xestimated(10): %f", Xestimated(10));
+    //     // ROS_INFO("Xestimated(11): %f", Xestimated(11));
+    //     // ROS_INFO("Xestimated(12): %f", Xestimated(12));
+    //     // ROS_INFO("Xestimated(13): %f", Xestimated(13));
+    //     // ROS_INFO("Xestimated(14): %f", Xestimated(14));
+    //     // ROS_INFO("Xestimated(15): %f", Xestimated(15));
+    //     // ROS_INFO("Xestimated(16): %f", Xestimated(16));
+    //     // ROS_INFO("Xestimated(17): %f", Xestimated(17));
+    //     // ROS_INFO("==========================over================================");
+
+    //     // KF_time_update(Xestimated,Pestimated,F,Q_noise);                                                           // 第三步：基于模型实现状态,协方差的运动迭代
+        
+    //     // Eigen::MatrixXd Temp_0 = F*Pestimated*(F.transpose());
+    //     // Eigen::MatrixXd Temp_0 = my_F;
+
+    //     // std::stringstream ss_Temp_0;
+    //     // ss_Temp_0 << Temp_0;
+    //     // ROS_INFO("=====================ss_Temp_0========================");
+    //     // ROS_INFO("Matrix:\n%s", ss_Temp_0.str().c_str());
+    //     // ROS_INFO("==========================over================================");
+        
+        
+    //     my_Xestimated = my_F*my_Xestimated;
+
+    //     std::stringstream ss_Temp_my_Pestimated_before;
+    //     ss_Temp_my_Pestimated_before << my_Pestimated;
+    //     cout<<"====================Time run here==========="<<__LINE__<<endl;
+    //     ROS_INFO("=====================ss_Temp_my_Pestimated_before(process)========================");
+    //     ROS_INFO("Matrix:\n%s", ss_Temp_my_Pestimated_before.str().c_str());
+    //     ROS_INFO("==========================over================================");
+
+    //     my_Pestimated = my_F*my_Pestimated*(my_F.transpose()) + my_Q;
+
+    //     std::stringstream ss_Temp_my_Pestimated_after;
+    //     ss_Temp_my_Pestimated_after << my_Pestimated;
+    //     cout<<"====================Time run here==========="<<__LINE__<<endl;
+    //     ROS_INFO("=====================ss_Temp_my_Pestimated_after(process)========================");
+    //     ROS_INFO("Matrix:\n%s", ss_Temp_my_Pestimated_after.str().c_str());
+    //     ROS_INFO("==========================over================================");
+    //     ROS_INFO("=====================3 kalman prediction finish=============================");
+
+    //     Eigen::MatrixXd Temp_0F = my_F;
+    //     std::stringstream ss_Temp_0F;
+    //     ss_Temp_0F << Temp_0F;
+    //     ROS_INFO("=====================ss_my_F(process)========================");
+    //     ROS_INFO("Matrix:\n%s", ss_Temp_0F.str().c_str());
+    //     ROS_INFO("==========================over================================");
+
+    //     std::stringstream ss_my_Q;
+    //     ss_my_Q << my_Q;
+    //     ROS_INFO("=====================ss_my_Q(process)========================");
+    //     ROS_INFO("Matrix:\n%s", ss_my_Q.str().c_str());
+    //     ROS_INFO("==========================over================================");
+
+
+    //     // ROS_INFO("===================size One========================");
+    //     // // std::cout<<"size of Pestimated: "<<Pestimated.rows()<<std::endl;
+    //     // ROS_INFO("Pestimated dimensions: %d x %d", my_Pestimated.rows(), my_Pestimated.cols());
+    //     // ROS_INFO("==========================over================================");
+
+    //     dataCount++;
+    //     cout<<"====================Time run here==========="<<__LINE__<<endl;
+    //     ROS_INFO("==============================================================");
+    //     ROS_INFO("==============================================================");
+    //     ROS_INFO("===================2 states process===========================");
+    //     ROS_INFO("==============================================================");
+    //     ROS_INFO("my_time show : %f ", state_server.imu_state.time );
+    //     // ROS_INFO("my_gyro show : %f %f %f", my_gyro[0],my_gyro[1],my_gyro[2]);
+    //     // ROS_INFO("my_acc show : %f %f %f", my_acc[0],my_acc[1],my_acc[2]);
+    //     ROS_INFO("===============navigation states ========================");
+    //     // 由于显示精度的问题，这里用cout
+    //     std::cout<<setprecision(20)<<"attitude : attix="<<state_server.imu_state.AttN[0]<<",attiy="<<state_server.imu_state.AttN[1]<<",attiz="<<state_server.imu_state.AttN[2]<<std::endl;  
+    //     std::cout<<setprecision(20)<<"velocity : velox="<<state_server.imu_state.velocity[0]<<",veloy="<<state_server.imu_state.velocity[1]<<",veloz="<<state_server.imu_state.velocity[2]<<std::endl;  
+    //     std::cout<<setprecision(20)<<"position : posix="<<state_server.imu_state.position[0]<<",posiy="<<state_server.imu_state.position[1]<<",posiz="<<state_server.imu_state.position[2]<<std::endl;  
+    //     std::cout<<setprecision(20)<<"time : time="<<state_server.imu_state.time<<std::endl;
+    //     ROS_INFO("===============coveriance ========================");  
+    //     std::stringstream ss_coveriance;
+    //     ss_coveriance << my_Pestimated;
+    //     ROS_INFO("=====================ss_Temp========================");
+    //     ROS_INFO("my_Pestimated Matrix:\n%s", ss_coveriance.str().c_str());
+    //     ROS_INFO("===================Xestimated========================");
+    //     std::stringstream ss_Xestimated;
+    //     ss_Xestimated << my_Xestimated;
+    //     ROS_INFO("=====================ss_Temp========================");
+    //     ROS_INFO("my_Xestimated Matrix:\n%s", ss_Xestimated.str().c_str());
+    //     ROS_INFO("==========================over================================");
+
+
+    //     if(dataCount>=10) // 100Hz频率下 1s更新一次
+    //     {
+    //         dataCount = 0;
+    //         // 618Dpro中消息的读取（GPS的位置）
+    //         MsckfVio::ForsenseMsgGpsPosiToEigen(msg_copy, m_posi_GPS_618Dpro);
+    //         // 注意由于msg中单位没有转换过来，这里进行转换处理
+    //         Eigen::Vector3d m_posi_GPS(m_posi_GPS_618Dpro[0]/1E7,m_posi_GPS_618Dpro[1]/1E7,m_posi_GPS_618Dpro[2]/1E3); //统一格式为经纬高（deg,deg,m）
+
+    //         measur_model_cal(m_posi_GPS);                                                            // 第四步：构建观测模型
+
+    //         // std::stringstream ss_Pestimated;
+    //         // ss_Pestimated << my_Pestimated;
+    //         // ROS_INFO("=====================Pestimated========================");
+    //         // ROS_INFO("Matrix:\n%s", ss_Pestimated.str().c_str());
+    //         // ROS_INFO("==========================over================================");
+
+    //         KF_meas_update();                                                           // 第五步：实现观测修正处理
+
+    //         ROS_INFO("============================================================GPS correction===================================================================");
+    //         cout<<"====================Time run here==========="<<__LINE__<<endl;
+    //         ROS_INFO("==============================================================");
+    //         ROS_INFO("==============================================================");
+    //         ROS_INFO("===================3 measurment estimation====================");
+    //         ROS_INFO("==============================================================");
+    //         ROS_INFO("my_time show : %f ", state_server.imu_state.time );
+    //         // ROS_INFO("my_gyro show : %f %f %f", my_gyro[0],my_gyro[1],my_gyro[2]);
+    //         // ROS_INFO("my_acc show : %f %f %f", my_acc[0],my_acc[1],my_acc[2]);
+    //         ROS_INFO("===============navigation states ========================");
+    //         // 由于显示精度的问题，这里用cout
+    //         std::cout<<setprecision(20)<<"attitude : attix="<<state_server.imu_state.AttN[0]<<",attiy="<<state_server.imu_state.AttN[1]<<",attiz="<<state_server.imu_state.AttN[2]<<std::endl;  
+    //         std::cout<<setprecision(20)<<"velocity : velox="<<state_server.imu_state.velocity[0]<<",veloy="<<state_server.imu_state.velocity[1]<<",veloz="<<state_server.imu_state.velocity[2]<<std::endl;  
+    //         std::cout<<setprecision(20)<<"position : posix="<<state_server.imu_state.position[0]<<",posiy="<<state_server.imu_state.position[1]<<",posiz="<<state_server.imu_state.position[2]<<std::endl;  
+    //         std::cout<<setprecision(20)<<"time : time="<<state_server.imu_state.time<<std::endl;
+    //         ROS_INFO("===============coveriance ========================");  
+    //         std::stringstream ss_coveriance3;
+    //         ss_coveriance3 << my_Pestimated;
+    //         ROS_INFO("=====================ss_Temp========================");
+    //         ROS_INFO("my_Pestimated Matrix:\n%s", ss_coveriance3.str().c_str());
+    //         ROS_INFO("===================Xestimated========================");
+    //         std::stringstream ss_Xestimated3;
+    //         ss_Xestimated3 << my_Xestimated;
+    //         ROS_INFO("=====================ss_Temp========================");
+    //         ROS_INFO("my_Xestimated Matrix:\n%s", ss_Xestimated3.str().c_str());
+    //         ROS_INFO("==========================over================================");
+
+    //         ROS_INFO("=====================6.1 error correction calculated complete=============================");
+
+    //         // INS_Correction(PosError,VelError,AttError);
+    //         INS_Correction(); 
+
+    //         cout<<"====================Time run here==========="<<__LINE__<<endl;
+    //         ROS_INFO("==============================================================");
+    //         ROS_INFO("==============================================================");
+    //         ROS_INFO("===================4 states update============================");
+    //         ROS_INFO("==============================================================");
+    //         ROS_INFO("my_time show : %f ", state_server.imu_state.time );
+    //         // ROS_INFO("my_gyro show : %f %f %f", my_gyro[0],my_gyro[1],my_gyro[2]);
+    //         // ROS_INFO("my_acc show : %f %f %f", my_acc[0],my_acc[1],my_acc[2]);
+    //         ROS_INFO("===============navigation states ========================");
+    //         // 由于显示精度的问题，这里用cout
+    //         std::cout<<setprecision(20)<<"attitude : attix="<<state_server.imu_state.AttN[0]<<",attiy="<<state_server.imu_state.AttN[1]<<",attiz="<<state_server.imu_state.AttN[2]<<std::endl;  
+    //         std::cout<<setprecision(20)<<"velocity : velox="<<state_server.imu_state.velocity[0]<<",veloy="<<state_server.imu_state.velocity[1]<<",veloz="<<state_server.imu_state.velocity[2]<<std::endl;  
+    //         std::cout<<setprecision(20)<<"position : posix="<<state_server.imu_state.position[0]<<",posiy="<<state_server.imu_state.position[1]<<",posiz="<<state_server.imu_state.position[2]<<std::endl;  
+    //         std::cout<<setprecision(20)<<"time : time="<<state_server.imu_state.time<<std::endl;
+    //         ROS_INFO("===============coveriance ========================");  
+    //         std::stringstream ss_coveriance4;
+    //         ss_coveriance4 << my_Pestimated;
+    //         ROS_INFO("=====================ss_Temp========================");
+    //         ROS_INFO("my_Pestimated Matrix:\n%s", ss_coveriance4.str().c_str());
+    //         ROS_INFO("===================Xestimated========================");
+    //         std::stringstream ss_Xestimated4;
+    //         ss_Xestimated4 << my_Xestimated;
+    //         ROS_INFO("=====================ss_Temp========================");
+    //         ROS_INFO("my_Xestimated Matrix:\n%s", ss_Xestimated4.str().c_str());
+    //         ROS_INFO("==========================over================================");
+
+    //         // publish_loose(msg_copy2);  
+
+    //     }
+
+    //     // 修正后的协方差进行状态传递
+    //     state_server.state_cov = my_Pestimated;
+
+    //     publish_loose(msg_copy2);                                                                                   // 第六步：相关消息的发布
+
+    // }
 
 }
 
@@ -1512,8 +1702,6 @@ void MsckfVio::KF_meas_update()
     Eigen::MatrixXd I = Eigen::MatrixXd::Identity(my_Pestimated.rows(),my_Pestimated.cols());
     my_Pestimated = (I - K*my_H)*Ppropagate;
 
-
-
     std::stringstream ss_my_Pestimated_update;
     ss_my_Pestimated_update << my_Pestimated;
     ROS_INFO("=====================ss_my_Pestimated_update(update)========================");
@@ -1798,84 +1986,84 @@ void MsckfVio::publish_loose(forsense_msg::Forsense msg_copy2)
 //     // 位置迭代处理
 // }
 
-void MsckfVio::imuCallback(const sensor_msgs::ImuConstPtr &msg)
-{
-    // ROS_INFO("START IMU DATA...");
+// void MsckfVio::imuCallback(const sensor_msgs::ImuConstPtr &msg)
+// {
+//     // ROS_INFO("START IMU DATA...");
 
-    // IMU msgs are pushed backed into a buffer instead of
-    // being processed immediately. The IMU msgs are processed
-    // when the next image is available, in which way, we can
-    // easily handle the transfer delay.
-    // 1. 存放imu数据
-    imu_msg_buffer.push_back(*msg);
+//     // IMU msgs are pushed backed into a buffer instead of
+//     // being processed immediately. The IMU msgs are processed
+//     // when the next image is available, in which way, we can
+//     // easily handle the transfer delay.
+//     // 1. 存放imu数据
+//     imu_msg_buffer.push_back(*msg);
 
-    // 2. 用200个imu数据做静止初始化，不够则不做
-    if (!is_gravity_set)
-    {
+//     // 2. 用200个imu数据做静止初始化，不够则不做
+//     if (!is_gravity_set)
+//     {
 
-        if (imu_msg_buffer.size() < 200)
-            return;
-        // if (imu_msg_buffer.size() < 10) return;
-        // imu初始化，200个数据必须都是静止时采集的
-        // 这里面没有判断是否成功，也就是一开始如果运动会导致轨迹飘
-        initializeGravityAndBias();
-        is_gravity_set = true;
-    }
-    // ROS_INFO("START IMU OUTPUT...");
+//         if (imu_msg_buffer.size() < 200)
+//             return;
+//         // if (imu_msg_buffer.size() < 10) return;
+//         // imu初始化，200个数据必须都是静止时采集的
+//         // 这里面没有判断是否成功，也就是一开始如果运动会导致轨迹飘
+//         initializeGravityAndBias();
+//         is_gravity_set = true;
+//     }
+//     // ROS_INFO("START IMU OUTPUT...");
 
-    return;
-}
+//     return;
+// }
 
-/**
- * @brief imu初始化，计算陀螺仪偏置，重力方向以及初始姿态，必须都是静止，且不做加速度计的偏置估计
- */
-void MsckfVio::initializeGravityAndBias()
-{
+// /**
+//  * @brief imu初始化，计算陀螺仪偏置，重力方向以及初始姿态，必须都是静止，且不做加速度计的偏置估计
+//  */
+// void MsckfVio::initializeGravityAndBias()
+// {
 
-    // Initialize gravity and gyro bias.
-    // 1. 角速度与加速度的和
-    Vector3d sum_angular_vel = Vector3d::Zero();
-    Vector3d sum_linear_acc = Vector3d::Zero();
+//     // Initialize gravity and gyro bias.
+//     // 1. 角速度与加速度的和
+//     Vector3d sum_angular_vel = Vector3d::Zero();
+//     Vector3d sum_linear_acc = Vector3d::Zero();
 
-    for (const auto &imu_msg : imu_msg_buffer)
-    {
-        Vector3d angular_vel = Vector3d::Zero();
-        Vector3d linear_acc = Vector3d::Zero();
+//     for (const auto &imu_msg : imu_msg_buffer)
+//     {
+//         Vector3d angular_vel = Vector3d::Zero();
+//         Vector3d linear_acc = Vector3d::Zero();
 
-        tf::vectorMsgToEigen(imu_msg.angular_velocity, angular_vel);
-        tf::vectorMsgToEigen(imu_msg.linear_acceleration, linear_acc);
+//         tf::vectorMsgToEigen(imu_msg.angular_velocity, angular_vel);
+//         tf::vectorMsgToEigen(imu_msg.linear_acceleration, linear_acc);
 
-        sum_angular_vel += angular_vel;
-        sum_linear_acc += linear_acc;
-    }
+//         sum_angular_vel += angular_vel;
+//         sum_linear_acc += linear_acc;
+//     }
 
-    // 2. 因为假设静止的，因此陀螺仪理论应该都是0，额外读数包括偏置+噪声，但是噪声属于高斯分布
-    // 因此这一段相加噪声被认为互相抵消了，所以剩下的均值被认为是陀螺仪的初始偏置
-    state_server.imu_state.gyro_bias =
-        sum_angular_vel / imu_msg_buffer.size();
-    // IMUState::gravity =
-    //   -sum_linear_acc / imu_msg_buffer.size();
-    //  This is the gravity in the IMU frame.
-    // 3. 计算重力，忽略加速度计的偏置，剩下的就只有重力了
-    Vector3d gravity_imu =
-        sum_linear_acc / imu_msg_buffer.size();
+//     // 2. 因为假设静止的，因此陀螺仪理论应该都是0，额外读数包括偏置+噪声，但是噪声属于高斯分布
+//     // 因此这一段相加噪声被认为互相抵消了，所以剩下的均值被认为是陀螺仪的初始偏置
+//     state_server.imu_state.gyro_bias =
+//         sum_angular_vel / imu_msg_buffer.size();
+//     // IMUState::gravity =
+//     //   -sum_linear_acc / imu_msg_buffer.size();
+//     //  This is the gravity in the IMU frame.
+//     // 3. 计算重力，忽略加速度计的偏置，剩下的就只有重力了
+//     Vector3d gravity_imu =
+//         sum_linear_acc / imu_msg_buffer.size();
 
-    // Initialize the initial orientation, so that the estimation
-    // is consistent with the inertial frame.
-    // 重力本来的方向
-    double gravity_norm = gravity_imu.norm();
-    IMUState::gravity = Vector3d(0.0, 0.0, -gravity_norm);
+//     // Initialize the initial orientation, so that the estimation
+//     // is consistent with the inertial frame.
+//     // 重力本来的方向
+//     double gravity_norm = gravity_imu.norm();
+//     IMUState::gravity = Vector3d(0.0, 0.0, -gravity_norm);
 
-    // 求出当前imu状态的重力方向与实际重力方向的旋转 tosee 查看谁到谁的
-    Quaterniond q0_i_w = Quaterniond::FromTwoVectors(
-        gravity_imu, -IMUState::gravity);
-    // 得出姿态
-    state_server.imu_state.orientation =
-        rotationToQuaternion(q0_i_w.toRotationMatrix().transpose());
+//     // 求出当前imu状态的重力方向与实际重力方向的旋转 tosee 查看谁到谁的
+//     Quaterniond q0_i_w = Quaterniond::FromTwoVectors(
+//         gravity_imu, -IMUState::gravity);
+//     // 得出姿态
+//     state_server.imu_state.orientation =
+//         rotationToQuaternion(q0_i_w.toRotationMatrix().transpose());
 
-    ROS_INFO("===============START IMU INIT========================");
-    return;
-}
+//     ROS_INFO("===============START IMU INIT========================");
+//     return;
+// }
 
 /**
  * @brief 重置

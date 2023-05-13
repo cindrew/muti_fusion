@@ -26,8 +26,10 @@
 // #include <forsense_msg/RtkVelocity.h>
 // 2023-04-29 这里改为旧的数据接口
 #include <forsense_msg/Forsense.h>
-// 2023-05-04 
+// 2023-05-04 用于轨迹显示
 #include <nav_msgs/Path.h>
+// 2023-05-12 用于618Dpro新消息的真值获取
+#include <nav_msgs/Odometry.h>
 
 #include <tf/transform_broadcaster.h>
 #include <std_srvs/Trigger.h>
@@ -119,8 +121,10 @@ private:
     //for GPS fusion,GPS数据的callback
     // void GPSCallback(const sensor_msgs::NavSatFix::Ptr &gps_msg);
     // void GPSVelCallback(const forsense_msg::RtkVelocity::Ptr &velo_msg);
-    // 2023-04-29 使用原有的消息类型接口
-    void GPSCallback(const forsense_msg::Forsense::Ptr &gps_msg);
+    // // 2023-04-29 使用原有的消息类型接口
+    // void GPSCallback(const forsense_msg::Forsense::Ptr &gps_msg);
+
+
 
 
     /*
@@ -215,6 +219,12 @@ private:
     // 2023-04-30 新增判断是否初始化完成（也就是参考值是否赋值作为初值）
     bool is_state_initial;
 
+    // 2023-05-12 新增判断IMU陀螺是否初始化完毕
+    bool is_gyrobias_set;
+
+    // 2023-05-13 新增判断是否第一次GPS消息，便于对state_serve的时间进行赋值
+    bool is_first_GPS;
+
     // The position uncertainty threshold is used to determine
     // when to reset the system online. Otherwise, the ever-
     // increaseing uncertainty will make the estimation unstable.
@@ -266,6 +276,9 @@ private:
     ros::Subscriber gps_sub;
     // ros::Subscriber gps_vel_sub;
 
+    // 基于新的消息，将真值读取进来
+    ros::Subscriber Tru_sub;
+
     // //temporarily//基于消息定义的GPS位置和速度buffer（注意要改这里的消息类型）
     // std::list<std::pair<double,sensor_msgs::NavSatFix>> GPS_buffer;
     // // std::list<std::pair<double,geometry_msgs::TwistWithCovarianceStamped>> GPS_vel_buffer;
@@ -297,7 +310,7 @@ private:
     // 2023-05-02 新增一个轨迹pub
     ros::Publisher path_pub;
     // 2023-05-03 
-    nav_msgs::Path path_msg;   // 将path定义在外部，避免"每次给这个path赋值,都是一个新的path,也就出现了很多poses,而每个poses只有一个pose."
+    nav_msgs::Path path_msg;  // 将path定义在外部，避免"每次给这个path赋值,都是一个新的path,也就出现了很多poses,而每个poses只有一个pose."
     // nav_msgs::Odometry Tru_msg;   // 新增一个真值轨迹，用于与解算轨迹对比
     nav_msgs::Path Tru_msg;   // 新增一个真值轨迹，用于与解算轨迹对比
 
@@ -383,6 +396,7 @@ private:
         // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];
         // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
     }
+
 
     void ForsenseMsgAccToEigen(const forsense_msg::Forsense &m, Eigen::Vector3d &e)
     {
@@ -470,9 +484,76 @@ private:
         void INS_Correction();     // IMU状态修正
 
     // void publish_loose();                              // 解算的轨迹等消息发布
-    void publish_loose(forsense_msg::Forsense msg_copy2);                              // 解算的轨迹等消息发布
+    void publish_loose(forsense_msg::Forsense msg_copy2);                             // 解算的轨迹等消息发布
 
 
+    // ===================================以下是为了新的消息类型新增函数段=================================
+    // 2023-05-12 使用新的标准消息类型接口
+    void GPSCallback(const sensor_msgs::NavSatFix::Ptr &gps_msg);
+
+    void ReferenceCallback(const nav_msgs::Odometry::Ptr  &reference_msg);
+
+
+    // 用于IMUcallback中IMU的角速度误差的修正处理
+    void initializeGyroBias();
+
+    // ===============================IMU类========================
+    // 基于新的消息类型进行的数据传输定义
+    void ForsenseMsgGyroRadNewToEigen(const sensor_msgs::Imu &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式（IMU角速度值信息）
+        e(0) = -m.angular_velocity.y;       // pitch 向上为+（右向）rad/s
+        e(1) = m.angular_velocity.x;        // roll 右旋为+(前向)  rad/s
+        e(2) = m.angular_velocity.z;        // yaw 左相为+（天向）  rad/s
+
+        // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];
+        // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
+    }
+
+    void ForsenseMsgGyroNewToEigen(const sensor_msgs::Imu &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式（IMU角速度值信息）
+        // e(0) = m.gyro[0];
+        // e(1) = m.gyro[1];
+        // e(2) = m.gyro[2];
+        e(0) = -m.angular_velocity.y * rad2deg;   // w_pitch  y轴 
+        e(1) = m.angular_velocity.x * rad2deg;    // w_roll   x轴
+        e(2) = m.angular_velocity.z * rad2deg;    // w_yaw    z轴
+
+        // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];
+        // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
+    }
+
+
+    // ===============================参考值类========================
+    void ForsenseMsgAttiNewToEigen(const nav_msgs::Odometry::Ptr &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式(姿态参考值信息)
+        e(0) = m->twist.twist.angular.x;  // roll(deg)
+        e(1) = m->twist.twist.angular.y;  // pitch(deg)
+        e(2) = m->twist.twist.angular.z;  // yaw(deg)
+    }
+
+    void ForsenseMsgVeloNewToEigen(const nav_msgs::Odometry::Ptr &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式（速度参考值信息）
+        // e(0) = m.twist.twist.linear.x;   // n(m/s/s)
+        // e(1) = m.twist.twist.linear.y;   // e(m/s/s)
+        // e(2) = m.twist.twist.linear.z;   // d(m/s/s)
+
+        e(0) = m->twist.twist.linear.y;   // e(m/s/s) 
+        e(1) = m->twist.twist.linear.x;   // n(m/s/s)
+        e(2) = -m->twist.twist.linear.z;   // u(m/s/s)
+    }
+
+    void ForsenseMsgPosiNewToEigen(const nav_msgs::Odometry::Ptr &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式（位置参考值信息）
+        // 由于位置部分参考值对应的是 lati,long,alti ，即经度，纬度，高度，所以这里进行顺序调整
+        e(0) = m->pose.pose.position.y/1E7;    //long
+        e(1) = m->pose.pose.position.x/1E7;    //lati
+        e(2) = m->pose.pose.position.z/1E3;    //alti
+    }
 
 
 
