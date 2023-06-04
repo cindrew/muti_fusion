@@ -63,7 +63,13 @@
       <!-- <remap from="~gps_velocity" to="/RtkVelocity_data"/> -->
 
       <!-- 2023-04-29 新增GPS的消息定义(符合旧的数据定义) remap重映射 将GPS消息重新改名-->
-      <remap from="~gps_position" to="/IMU_618DPREO_data"/>
+      <!-- <remap from="~gps_position" to="/IMU_618DPREO_data"/> -->
+      <!-- 2023-05-12 新增GPS的新的消息定义 remap重映射 将GPS消息重新改名-->
+      <remap from="~gps_position" to="/gps_data"/>
+      <!-- 2023-05-12 新增参考值的新的消息定义 remap重映射 将参考值消息重新改名-->
+      <remap from="~Reference_states" to="/odr_data"/>
+      <!-- 2023-05-17 新增小车RTK参考值的新的消息定义 remap重映射 将参考值消息重新改名-->
+      <remap from="~Reference_Car_states" to="/nmea_sentence"/>
 
     </node>
   </group>

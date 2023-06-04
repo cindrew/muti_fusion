@@ -26,8 +26,13 @@
 // #include <forsense_msg/RtkVelocity.h>
 // 2023-04-29 这里改为旧的数据接口
 #include <forsense_msg/Forsense.h>
-// 2023-05-04 
+// 2023-05-04 用于轨迹显示
 #include <nav_msgs/Path.h>
+// 2023-05-12 用于618Dpro新消息的真值获取
+#include <nav_msgs/Odometry.h>
+// 2023-05-17 用于小车搭载RTK真实数据的获取
+#include <nmea_msgs/Sentence.h>
+
 
 #include <tf/transform_broadcaster.h>
 #include <std_srvs/Trigger.h>
@@ -119,8 +124,10 @@ private:
     //for GPS fusion,GPS数据的callback
     // void GPSCallback(const sensor_msgs::NavSatFix::Ptr &gps_msg);
     // void GPSVelCallback(const forsense_msg::RtkVelocity::Ptr &velo_msg);
-    // 2023-04-29 使用原有的消息类型接口
-    void GPSCallback(const forsense_msg::Forsense::Ptr &gps_msg);
+    // // 2023-04-29 使用原有的消息类型接口
+    // void GPSCallback(const forsense_msg::Forsense::Ptr &gps_msg);
+
+
 
 
     /*
@@ -205,6 +212,13 @@ private:
     // transfer delay between IMU and Image messages.
     std::vector<sensor_msgs::Imu> imu_msg_buffer;
 
+    // 2023-05-13 新增GPS的消息队列
+    std::vector<sensor_msgs::NavSatFix> GPS_msg_buffer;
+
+    std::vector<nav_msgs::Odometry> Reference_msg_buffer;
+
+    std::vector<nmea_msgs::Sentence> Reference_Car_msg_buffer;
+
     // Indicate if the gravity vector is set.
     bool is_gravity_set;
 
@@ -214,6 +228,12 @@ private:
 
     // 2023-04-30 新增判断是否初始化完成（也就是参考值是否赋值作为初值）
     bool is_state_initial;
+
+    // 2023-05-12 新增判断IMU陀螺是否初始化完毕
+    bool is_gyrobias_set;
+
+    // 2023-05-13 新增判断是否第一次GPS消息，便于对state_serve的时间进行赋值
+    bool is_first_GPS;
 
     // The position uncertainty threshold is used to determine
     // when to reset the system online. Otherwise, the ever-
@@ -266,6 +286,12 @@ private:
     ros::Subscriber gps_sub;
     // ros::Subscriber gps_vel_sub;
 
+    // 基于新的消息，将真值读取进来
+    ros::Subscriber Tru_sub;
+
+    // 小车RTK真值的读取输出
+    ros::Subscriber Tru_car_sub;
+
     // //temporarily//基于消息定义的GPS位置和速度buffer（注意要改这里的消息类型）
     // std::list<std::pair<double,sensor_msgs::NavSatFix>> GPS_buffer;
     // // std::list<std::pair<double,geometry_msgs::TwistWithCovarianceStamped>> GPS_vel_buffer;
@@ -293,13 +319,16 @@ private:
     ros::Publisher Tru_pub;
     ros::Publisher Tru_vel_pub;
     ros::Publisher Tru_atti_pub;
+    ros::Publisher Tru_Car_pub;
 
     // 2023-05-02 新增一个轨迹pub
     ros::Publisher path_pub;
     // 2023-05-03 
-    nav_msgs::Path path_msg;   // 将path定义在外部，避免"每次给这个path赋值,都是一个新的path,也就出现了很多poses,而每个poses只有一个pose."
+    nav_msgs::Path path_msg;  // 将path定义在外部，避免"每次给这个path赋值,都是一个新的path,也就出现了很多poses,而每个poses只有一个pose."
     // nav_msgs::Odometry Tru_msg;   // 新增一个真值轨迹，用于与解算轨迹对比
     nav_msgs::Path Tru_msg;   // 新增一个真值轨迹，用于与解算轨迹对比
+    // 2023-05-17
+    nav_msgs::Path Tru_Car_msg;   // 新增一个小车真值轨迹，用于与解算轨迹对比
 
 
     // // ==================================以下是新增为了松组合添加的模块============================================
@@ -383,6 +412,7 @@ private:
         // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];
         // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
     }
+
 
     void ForsenseMsgAccToEigen(const forsense_msg::Forsense &m, Eigen::Vector3d &e)
     {
@@ -469,10 +499,270 @@ private:
     // void INS_Correction(Eigen::VectorXd Xestimated);     // IMU状态修正
         void INS_Correction();     // IMU状态修正
 
-    // void publish_loose();                              // 解算的轨迹等消息发布
-    void publish_loose(forsense_msg::Forsense msg_copy2);                              // 解算的轨迹等消息发布
+    void publish_loose();                              // 解算的轨迹等消息发布
+    // void publish_loose(forsense_msg::Forsense msg_copy2);                             // 解算的轨迹等消息发布
 
 
+    // ===================================以下是为了新的消息类型新增函数段=================================
+    // 2023-05-12 使用新的标准消息类型接口
+    void GPSCallback(const sensor_msgs::NavSatFix::Ptr &gps_msg);
+
+    void ReferenceCallback(const nav_msgs::Odometry::Ptr  &reference_msg);
+
+    void ReferenceCarCallback(const nmea_msgs::Sentence::Ptr  &reference_Car_msg);
+
+    // 用于IMUcallback中IMU的角速度误差的修正处理
+    void initializeGyroBias();
+
+    // ===============================IMU类========================
+    // 基于新的消息类型进行的数据传输定义
+    void ForsenseMsgGyroRadNewToEigen(const sensor_msgs::Imu &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式（IMU角速度值信息）
+        e(0) = -m.angular_velocity.y;       // pitch 向上为+（右向）rad/s
+        e(1) = m.angular_velocity.x;        // roll 右旋为+(前向)  rad/s
+        e(2) = m.angular_velocity.z;        // yaw 左相为+（天向）  rad/s
+
+        // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];
+        // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
+    }
+
+    void ForsenseMsgGyroNewToEigen(const sensor_msgs::Imu &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式（IMU角速度值信息）
+        // e(0) = m.gyro[0];
+        // e(1) = m.gyro[1];
+        // e(2) = m.gyro[2];
+        e(0) = -m.angular_velocity.y * rad2deg;   // w_pitch  y轴 
+        e(1) = m.angular_velocity.x * rad2deg;    // w_roll   x轴
+        e(2) = m.angular_velocity.z * rad2deg;    // w_yaw    z轴
+
+        // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];
+        // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
+    }
+
+    void ForsenseMsgAccNewToEigen(const sensor_msgs::Imu &m, Eigen::Vector3d &e)
+    {
+        // 原有消息已经加了g了
+        // double g=9.7803698;         // 重力加速度
+        // e(0) = -m.linear_acceleration.y * g;   // acc_y轴 R
+        // e(1) = m.linear_acceleration.x * g;    // acc_x轴 F
+        // e(2) = m.linear_acceleration.z * g;    // acc_z轴 U
+        e(0) = -m.linear_acceleration.y ;   // acc_y轴 R
+        e(1) = m.linear_acceleration.x ;    // acc_x轴 F
+        e(2) = m.linear_acceleration.z ;    // acc_z轴 U
+
+        // m_gyro_618Dpro_RFU << -m_gyro_618Dpro[1], m_gyro_618Dpro[0], m_gyro_618Dpro[2];
+        // m_gyro_618Dpro_RFU_deg = m_gyro_618Dpro_RFU * rad2deg;  // （deg/s）
+    }
+
+    // ===============================GPS类========================
+    void ForsenseMsgGpsPosiNewToEigen(const sensor_msgs::NavSatFix &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式（GPS提供的经纬高位置）
+        e(0) = m.longitude;
+        e(1) = m.latitude;
+        e(2) = m.altitude;
+    }
+
+
+
+    // ===============================参考值类========================
+    void ForsenseMsgAttiNewToEigen(const nav_msgs::Odometry::Ptr &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式(姿态参考值信息)
+        e(0) = m->twist.twist.angular.x;  // roll(deg)
+        e(1) = m->twist.twist.angular.y;  // pitch(deg)
+        e(2) = m->twist.twist.angular.z;  // yaw(deg)
+    }
+
+    void ForsenseMsgVeloNewToEigen(const nav_msgs::Odometry::Ptr &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式（速度参考值信息）
+        // e(0) = m.twist.twist.linear.x;   // n(m/s/s)
+        // e(1) = m.twist.twist.linear.y;   // e(m/s/s)
+        // e(2) = m.twist.twist.linear.z;   // d(m/s/s)
+
+        e(0) = m->twist.twist.linear.y;   // e(m/s/s) 
+        e(1) = m->twist.twist.linear.x;   // n(m/s/s)
+        e(2) = -m->twist.twist.linear.z;   // u(m/s/s)
+    }
+
+    void ForsenseMsgPosiNewToEigen(const nav_msgs::Odometry::Ptr &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将自定义的数据转为Eigen中的向量形式（位置参考值信息）
+        // 由于位置部分参考值对应的是 lati,long,alti ，即经度，纬度，高度，所以这里进行顺序调整
+        e(0) = m->pose.pose.position.y;    //long
+        e(1) = m->pose.pose.position.x;    //lati
+        e(2) = m->pose.pose.position.z;    //alti
+    }
+
+    void ForsenseMsgPosiBufferToEigen(const nav_msgs::Odometry &m, Eigen::Vector3d &e)
+    {
+        // 这里主要是将buffer数据转为Eigen中的向量形式（位置参考值信息）
+        // 由于位置部分参考值对应的是 lati,long,alti ，即经度，纬度，高度，所以这里进行顺序调整
+        // 由于新消息中将单位转到了正确的位数上，所以这里不进行单位转换处理
+        e(0) = m.pose.pose.position.y;    //long
+        e(1) = m.pose.pose.position.x;    //lati
+        e(2) = m.pose.pose.position.z;    //alti
+    }
+
+    void ForsenseMsgPosiCarBufferToEigen(const nmea_msgs::Sentence &m, Eigen::Vector3d &e)
+    {
+        //基于小车的RTK消息进行读取处理
+        // 由于记录的是GPGGA格式，所以需要从字符中提取出对应的经纬高
+
+        // nmea_msgs::Sentence gpgga_sentence ;
+        // gpgga_sentence.sentence = m.sentence;  // 从消息中获取 GPGGA 语句字符串
+
+        // std::string gpgga_sentence_str = gpgga_sentence.sentence;  //从消息对象中获取 GPGGA 语句字符串
+        // gpgga_fields = gpgga_sentence_str.split(',') ; // 分割 GPGGA 语句的字段
+
+        // gpgga_fields = gpgga_sentence.sentence.split(',');  // 分割 GPGGA 语句的字段
+
+        // e(0) = m.sentence.;    //long
+
+        double latitude, longitude, altitude;
+
+        nmea_msgs::Sentence gpggaSentence ;
+        gpggaSentence.sentence = m.sentence;  // 从消息中获取 GPGGA 语句字符串
+
+        parseGPGGA(gpggaSentence.sentence, latitude, longitude, altitude);
+
+        e(0) = longitude;    //long
+        e(1) = latitude;    //lati
+        e(2) = altitude;    //alti
+
+    }
+
+    // RTK的GPGGA格式的处理
+    void ForsenseMsgPosiCarMsgToEigen(const nmea_msgs::Sentence::Ptr &m, Eigen::Vector3d &e)
+    {
+        double latitude, longitude, altitude;
+
+        nmea_msgs::Sentence gpggaSentence ;
+        gpggaSentence.sentence = m->sentence;  // 从消息中获取 GPGGA 语句字符串
+
+        parseGPGGA(gpggaSentence.sentence, latitude, longitude, altitude);
+
+        e(0) = longitude;    //long
+        e(1) = latitude;    //lati
+        e(2) = altitude;    //alti
+
+    }
+
+    // 解析 GPGGA 语句并提取经纬度和高度信息
+    void parseGPGGA(const std::string& gpggaSentence, double& latitude, double& longitude, double& altitude) {
+        // 分割 GPGGA 语句的字段
+        std::stringstream ss(gpggaSentence);
+        std::vector<std::string> fields;
+        std::string field;
+        while (std::getline(ss, field, ',')) {
+            fields.push_back(field);
+        }
+
+        // 提取经度字段（llll.ll）
+        std::string latitudeDMS = fields[2];
+        double latitudeDeg = std::stod(latitudeDMS.substr(0, 2));   //从第一位开始，取2个数
+        double latitudeMin = std::stod(latitudeDMS.substr(2, 8));
+        // double latitudeSec = std::stod(latitudeDMS.substr(4));
+        // latitude = latitudeDeg + (latitudeMin / 60) + (latitudeSec / 3600);
+        latitude = latitudeDeg + (latitudeMin / 60);
+
+        // 提取纬度字段（yyyyy.yy）
+        std::string longitudeDMS = fields[4];
+        double longitudeDeg = std::stod(longitudeDMS.substr(0, 3));  //从第一位开始，取3个数
+        double longitudeMin = std::stod(longitudeDMS.substr(3, 8));
+        // double longitudeSec = std::stod(longitudeDMS.substr(5));
+        // longitude = longitudeDeg + (longitudeMin / 60) + (longitudeSec / 3600);
+        longitude = longitudeDeg + (longitudeMin / 60);
+
+        // 提取高度字段
+        altitude = std::stod(fields[9]);
+    }
+
+    // RTK的GPFPD格式的处理
+    void ForsenseMsgPosiCarGpfpdBufferToEigen(const nmea_msgs::Sentence &m,  Eigen::Vector3d &atti, Eigen::Vector3d &velo, Eigen::Vector3d &posi)
+    {
+        //基于小车的RTK消息进行读取处理
+
+        double heading, pitch, roll;
+        double latitude, longitude, altitude;
+        double ve, vn, vu;
+
+        nmea_msgs::Sentence gpggaSentence ;
+        gpggaSentence.sentence = m.sentence;  // 从消息中获取 GPGGA 语句字符串
+
+        // parseGPGGA(gpggaSentence.sentence, latitude, longitude, altitude);
+        parseGPFPD(gpggaSentence.sentence, heading, pitch, roll, ve, vn, vu, latitude, longitude, altitude);
+
+        atti(0) = roll;       //roll
+        atti(1) = pitch;      //pitch
+        atti(2) = heading;    //heading
+
+        velo(0) = ve;    //ve
+        velo(1) = vn;    //vn
+        velo(2) = vu;    //vu
+
+        posi(0) = longitude;   //longitude
+        posi(1) = latitude;    //latitude
+        posi(2) = altitude;    //altitude
+
+    }
+
+    // RTK的GPFPD格式的处理
+    void ForsenseMsgPosiCarGpfpdMsgToEigen(const nmea_msgs::Sentence::Ptr &m, Eigen::Vector3d &atti, Eigen::Vector3d &velo, Eigen::Vector3d &posi)
+    {
+        double heading, pitch, roll;
+        double latitude, longitude, altitude;
+        double ve, vn, vu;
+
+        nmea_msgs::Sentence gpggaSentence ;
+        gpggaSentence.sentence = m->sentence;  // 从消息中获取 GPGGA 语句字符串
+
+        // parseGPGGA(gpggaSentence.sentence, latitude, long?itude, altitude);
+        parseGPFPD(gpggaSentence.sentence, heading, pitch, roll, ve, vn, vu, latitude, longitude, altitude);
+
+        atti(0) = roll;       //roll
+        atti(1) = pitch;      //pitch
+        atti(2) = heading;    //heading
+
+        velo(0) = ve;    //ve
+        velo(1) = vn;    //vn
+        velo(2) = vu;    //vu
+
+        posi(0) = longitude;   //longitude
+        posi(1) = latitude;    //latitude
+        posi(2) = altitude;    //altitude
+
+    }
+
+    // 解析 GPFPD 语句并提取航向角、ENU速度以及经纬高
+    void parseGPFPD(const std::string& gpggaSentence, double& heading, double& pitch, double& roll,
+        double& ve, double& vn, double& vu,double& latitude, double& longitude, double& altitude) {
+        // 分割 GPFPD 语句的字段
+        std::stringstream ss(gpggaSentence);
+        std::vector<std::string> fields;
+        std::string field;
+        while (std::getline(ss, field, ',')) {
+            fields.push_back(field);
+        }
+
+        // 提取姿态字段
+        heading = std::stod(fields[3]);
+        pitch = std::stod(fields[4]);
+        roll = std::stod(fields[5]);
+
+        // 提取位置字段
+        latitude = std::stod(fields[6]);
+        longitude = std::stod(fields[7]);
+        altitude = std::stod(fields[8]);
+
+        // 提取速度字段
+        ve = std::stod(fields[9]);
+        vn = std::stod(fields[10]);
+        vu = std::stod(fields[11]);
+    }
 
 
 
