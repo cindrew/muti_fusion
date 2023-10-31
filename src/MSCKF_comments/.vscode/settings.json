@@ -1,0 +1,32 @@
+{
+    "ros.distro": "melodic",
+    "files.associations": {
+        "*.ipp": "cpp",
+        "array": "cpp",
+        "deque": "cpp",
+        "list": "cpp",
+        "string": "cpp",
+        "unordered_map": "cpp",
+        "vector": "cpp",
+        "string_view": "cpp",
+        "initializer_list": "cpp",
+        "*.tcc": "cpp",
+        "iosfwd": "cpp",
+        "fstream": "cpp",
+        "iomanip": "cpp",
+        "iostream": "cpp",
+        "ostream": "cpp",
+        "core": "cpp",
+        "bitset": "cpp",
+        "utility": "cpp"
+    },
+    "cmake.configureOnOpen": false,
+    "python.autoComplete.extraPaths": [
+        "/home/ubuntu/workspace/gnss_process_evaluate_gpFPD/devel/lib/python2.7/dist-packages",
+        "/opt/ros/melodic/lib/python2.7/dist-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/ubuntu/workspace/gnss_process_evaluate_gpFPD/devel/lib/python2.7/dist-packages",
+        "/opt/ros/melodic/lib/python2.7/dist-packages"
+    ]
+}
